@@ -1,0 +1,33 @@
+# ---------------------------------------------------------------------
+# 本机个性化值（ComfyUI 路径、参考音频、QQ uin、token）不要写进这份入库的
+# profile：复制一份为 config.local.toml（已被 .gitignore 忽略），启动时加
+#   python -m fatfish --config config.local.toml serve
+# 所有需要用户自填的键汇总见 config/example.toml。
+# ---------------------------------------------------------------------
+# Staging overlay for the IndexTTS-2.5 + v6 whale-girl live test.
+# Used as:  python -m fatfish --config config/tts25-live.toml serve
+# It only overrides what the test needs; everything else comes from low.toml.
+
+[tts]
+engine = "indextts25"
+cache_version = "v6-25-live"
+base_url = "http://127.0.0.1:9882/tts"
+timeout_seconds = 180
+# Sentence-level streaming: runtime splits the reply, synthesizes one segment,
+# hands it to the web stream, then continues with the next segment.
+short_sentence_mode = true
+stream_sentences = true
+segment_policy = "sentence"
+max_chars_per_sentence = 20
+
+[voice]
+# The live test is about timbre/emotion, not about the proactive gate.
+# Force a voice attempt for every private turn.
+force = true
+min_score = 0.0
+text_with_voice_min = 0.0
+max_per_hour = 99
+max_per_day = 999
+
+[web]
+port = 8799

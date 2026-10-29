@@ -1,0 +1,103 @@
+# ---------------------------------------------------------------------
+# 本机个性化值（ComfyUI 路径、参考音频、QQ uin、token）不要写进这份入库的
+# profile：复制一份为 config.local.toml（已被 .gitignore 忽略），启动时加
+#   python -m fatfish --config config.local.toml serve
+# 所有需要用户自填的键汇总见 config/example.toml。
+# ---------------------------------------------------------------------
+# cloud profile：在线层（thin online tier），合并顺序 low.toml < cloud.toml。
+#
+# 用途：把「接入层 + 编排层 + 记忆层」放到一台 2C2G 云主机上，让 QQ / Web /
+# 记忆 24h 在线；GPU 能力（TTS / 唱歌 / 拍照）留在家里。
+# 家里没开机时她退化成纯文字——这是设计，不是故障。
+#
+# 本文件是**最小覆盖层**：没写在这里的键全部继承 low.toml。
+# 改这里的任何一个键，同步改 tests/test_config_profiles.py 的 cloud 快照。
+# 决策背景与验收判据见 docs/adr/0012-online-tier.md。
+#
+# 实测内存（2026-10-29，真实库只读副本，hash 256 维）：
+#   MemoryService           26.3 MB
+#   全部服务（含贴纸索引）   39.0 MB
+#   记忆库本身不是瓶颈；向量服务才是（torch cu128 import 483MB + bge 391MB）。
+
+[app]
+profile = "cloud"
+
+# 第一阶段：纯文字。家里 GPU 不在线时不要尝试本地 TTS。
+# 开语音时在 cloud.local.toml 里把 enabled 改回 true 并配好 base_url
+# （例如 https://<家里>.<tailnet>.ts.net:9443/tts）；下面的 [remote] 探针会
+# 从 base_url 自动推导 /health，家里关机就秒回文字。
+[tts]
+enabled = false
+
+# 语音发送策略一并关掉：没有 TTS 还让它决策，只会往日志里灌失败。
+[voice]
+enabled = false
+
+# 唱歌（T-0067）：云端没有 .venv-soulx / vendor/SoulX-Singer，但家里有。
+# mode="remote" → 云上只做编排：POST 到家里 scripts/sing_server.py（用
+# tailscale serve 暴露成 https 9445），拿回 wav 存本地 data/songs 并写自己的
+# sing_jobs，QQ record / Web /api/audio 全都不用改。
+# 家里关机或超时 → **立刻**只回一句文字（friendly_sing_error），不会让用户等满
+# remote_timeout_seconds；详见 docs/branches/singing.md「云端唱歌（T-0067）」。
+# enabled 从 low.toml 继承（true）——这里的 enable 由「家里在不在」决定。
+[sing]
+mode = "remote"
+# 实际地址写在 /opt/fatfish/config/cloud.local.toml，别把 tailnet 名字提交进来。
+remote_url = "https://fatfish-home.example-tailnet.ts.net:9445"
+remote_token_env = "SING_SERVER_TOKEN"   # 与家里 --token-env 同一个环境变量
+remote_timeout_seconds = 420             # 家里 --timeout；客户端自动多等 30s
+
+# 拍照（T-0068）：云端没有 GPU，也没有 ComfyUI——图在家里那台机器上画。
+# mode="remote" → 云上只做编排：POST 到家里的 /photo（body 是 JSON 绘图参数，
+# 回 png 字节），存自己的 data/photos 并写 photo_jobs，Web / QQ 发送链路都不用改。
+# 家里关机 / 超时 / 回的不是图 → **立刻**只回一句文字（friendly_photo_error），
+# 不会让用户等满 ComfyUI 冷启动（30–120s）。详见 docs/branches/media.md。
+# enabled 从 low.toml 继承（true）——能不能拍由「家里在不在」决定。
+[photo]
+mode = "remote"
+# 实际地址写在 /opt/fatfish/config/cloud.local.toml，别把 tailnet 名字提交进来。
+remote_url = "https://fatfish-home.example-tailnet.ts.net:9446"
+remote_token_env = "PHOTO_SERVER_TOKEN"   # 与家里 photo_server 的 --token-env 同名
+remote_timeout_seconds = 180              # ComfyUI 冷启动 30–120s，留余量
+# 想让 `fatfish remote` 也探一下家里，再把上面的 [remote] enabled 打开；
+# [photo] 是可选的「能力位」，它挂了不会把 TTS 判成离线。
+
+# 贴纸检索：low.toml 默认 http（本地 bge 768 维，约 900MB RSS）。
+# 2C2G 上不跑 bge，退到内置 hash（256 维、零依赖）。
+# 配套动作（2026-10-31，task/cloud2）：
+#   1. 库向量必须用 hash 重算（python staging_reembed.py --db
+#      data/fatfish.db --backend hash --apply，自带备份）。库里若还是
+#      768 维旧向量，与 256 维查询宽度不符，余弦恒为 0，打分退化成
+#      0.25×关键词 + 0.30×意图；
+#   2. 查询侧同义词扩展已内置（fatfish/sticker/lexicon.py，「惊到」能桥到
+#      「惊讶」，「委屈」能桥到「难过」）。只扩查询侧，调词表改代码即可，
+#      永远不用重算库；
+#   3. 改动后用 scripts/sticker_recall_eval.py --db data/fatfish.db 复测。
+#      2026-10-31 基线：hit@1 18/20、hit@3 20/20（非零余弦 p50 0.40、
+#      p90 0.59）；demo 模式 13/13，进 CI 口径。
+# 标定（2026-10-31 定版，值写在本机的 cloud.local.toml）：similarity_floor=0.15、
+# similarity_ceil=0.60。依据：hash 非零余弦实测 p50 0.26 / p90 0.45 / max 0.88
+# （scripts/sticker_recall_eval.py --db），不拉伸时中等匹配（0.27-0.37 分）
+# 够不着 0.45 自发阈值；拉伸后好匹配上浮（晚安 0.58->0.72、开心 0.27->0.50）、
+# 事务句原地不动（0.16 仍拒发）。查询侧同义词扩展取 max(原句,扩展) 两向量
+# 的相似度，别名不稀释本来匹配得好的查询。
+# 第二阶段（家里在线时）改回 "http" 并把 embedding_url 指向家里的 9881。
+[sticker]
+embedding_backend = "hash"
+
+# QQ 空间要浏览器扫码拿 cookie；云端没有浏览器。第一阶段关闭；
+# 把家里的 data/qzone_cookies.json 拷过来后再打开 enabled。
+[qzone]
+enabled = false
+
+# 能力层探针：家里那台 GPU 机还在不在（TTS 合成前会先看这个开关）。
+# 云端**默认开着**：家里关机时语音立刻退回文字，不会每句话都等满
+# tts.timeout_seconds（20s）。不开 = 不做探测 = 每句白等 20s 才失败。
+# 详见 fatfish/remote.py 与 docs/branches/ops.md「云端独立性与降级矩阵」。
+[remote]
+enabled = true
+# home_url 留空即可：从 [tts] base_url 自动推导 scheme://host:port，
+# 再拼 /health。只有「TTS 地址和探针地址不同」时才需要显式覆盖。
+# home_url = "http://fatfish-home:9880"        # Tailscale MagicDNS 名或 100.x IP
+health_ttl_seconds = 30
+timeout_seconds = 3

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>鲸鱼娘 · 流式语音</title>
+<style>
+:root{--bg:#141019;--card:#1e1826;--line:#332a40;--pink:#ff8fb1;--pink2:#ffc2d4;
+--txt:#f2eaf5;--dim:#a99bb8}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);
+font:16px/1.6 "PingFang SC","Microsoft YaHei",system-ui,sans-serif}
+.wrap{max-width:760px;margin:0 auto;padding:22px 16px 120px}
+h1{font-size:22px;margin:0 0 4px;color:var(--pink2)}
+.sub{color:var(--dim);font-size:13px;margin:0 0 18px}
+.log{display:flex;flex-direction:column;gap:12px}
+.row{max-width:86%;padding:10px 13px;border-radius:14px;white-space:pre-wrap}
+.me{align-self:flex-end;background:#2b3550;border:1px solid #3a4a70}
+.her{align-self:flex-start;background:var(--card);border:1px solid var(--line)}
+.meta{font-size:12px;color:var(--dim);margin-top:6px}
+.seg{border-left:2px solid var(--pink);padding-left:8px;margin:6px 0}
+.seg.pending{opacity:.55}
+.badge{display:inline-block;background:#2a2136;border:1px solid var(--line);
+border-radius:999px;padding:1px 8px;font-size:11px;color:var(--dim);margin-right:6px}
+.bar{position:fixed;left:0;right:0;bottom:0;background:#181220;
+border-top:1px solid var(--line);padding:10px 12px}
+.bar form{max-width:760px;margin:0 auto;display:flex;gap:8px}
+input{flex:1;background:#241b2e;border:1px solid var(--line);border-radius:10px;
+color:var(--txt);padding:10px 12px;font-size:15px;outline:none}
+button{background:var(--pink);border:0;border-radius:10px;color:#2a0d18;
+font-weight:700;padding:10px 16px;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+.play{display:none;margin-top:8px}
+.toggle{display:flex;align-items:center;gap:5px;font-size:13px;color:var(--dim);white-space:nowrap}
+.toggle input{accent-color:var(--pink)}
+.err{color:#ff9b9b;font-size:13px;margin-top:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>鲸鱼娘 · 按句流式</h1>
+  <p class="sub">IndexTTS-2.5 · 合成一句就播一句 · 默认逐句播放；连续播会有空白（合成慢于播放）</p>
+  <div id="log" class="log"></div>
+</div>
+<div class="bar"><form id="form">
+  <input id="text" autocomplete="off" placeholder="跟她说点什么……" maxlength="300">
+  <label class="toggle"><input type="checkbox" id="continuous"> 连续播放</label>
+  <button id="send" type="submit">发送</button>
+</form></div>
+
+<script src="/stream.js?v=2"></script>
+</body>
+</html>
+

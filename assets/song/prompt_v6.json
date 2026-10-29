@@ -1,0 +1,15 @@
+[
+ {
+  "index": "cand_home_up1",
+  "language": "Mandarin",
+  "time": [
+   0,
+   5920
+  ],
+  "duration": "0.2400 0.3000 0.0400 0.2600 0.2400 0.1400 0.3200 0.1000 0.2400 0.0600 0.2400 0.1400 0.3400 0.0400 0.3600 0.1200 0.1200 0.1800 0.4000 0.1200 0.0400 0.4600 0.1000 0.0400 0.3000 0.1200 0.3200 0.1600",
+  "text": "哼 主 人 哥 哥 回 来 啦 本 鲸 鱼 娘 才 没 有 一 直 等 你 呢 尾 巴 尾 巴 自 己 摇 的",
+  "phoneme": "zh_heng1 zh_zhu3 zh_ren2 zh_ge1 zh_ge1 zh_hui2 zh_lai2 zh_la1 zh_ben3 zh_jing1 zh_yu2 zh_niang2 zh_cai2 zh_mei2 zh_you3 zh_yi1 zh_zhi2 zh_deng3 zh_ni3 zh_ne5 zh_wei3 zh_ba1 zh_wei3 zh_ba1 zh_zi4 zh_ji3 zh_yao2 zh_de5",
+  "note_pitch": "69 65 65 64 73 66 69 61 59 65 60 66 66 71 69 68 65 65 62 55 65 64 65 68 63 73 61 60",
+  "note_type": "2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2"
+ }
+]

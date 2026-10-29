@@ -1,0 +1,343 @@
+# standard profile: discrete GPU expected; still remote-friendly
+[app]
+name = "fatfish"
+profile = "standard"
+timezone = "Asia/Shanghai"
+data_dir = "data"
+
+[llm]
+provider = "opencode_go"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+model = "deepseek-v4.1-flash"
+# model = "deepseek-v4-pro"   # optional higher-quality variant
+api_key_env = "FATFISH_OPENCODE_KEY"
+api_style = "chat_completions"
+# user_agent 从包版本单点生成（fatfish/__init__.py），不再在 profile 里写死。
+send_session_header = true
+max_output_tokens = 1000
+temperature = 0.8
+reasoning_effort = "low"
+timeout_seconds = 120
+# org_id = "org_..."
+# [llm.headers]
+# X-My-Header = "value"
+
+[decision]
+backend = "kev"
+kev_base_url = "http://127.0.0.1:8009"
+kev_model = "jaredpalmer/kev-4b"
+kev_timeout_seconds = 5.0
+
+[memory]
+embedding_backend = "hash"
+embedding_dim = 512
+recent_days = 30
+short_term_ttl_days = 7
+compact_hour = 0
+compact_minute = 30
+quiet_start = "23:30"
+quiet_end = "08:00"
+max_items_per_search = 10000
+candidate_limit = 1024
+recall_threshold = 0.32
+rag_threshold = 0.25
+recall_kev_threshold = 0.48
+recall_top_k = 5
+rag_top_k = 4
+event_gap_minutes = 45
+event_min_gap_for_topic_minutes = 10
+event_topic_shift_threshold = 0.15
+today_timeline_chars = 1200
+nightly_voice = true
+nightly_voice_max_tokens = 350
+archive_backfill_days = 3
+event_max_per_day = 20
+
+[voice]
+enabled = true
+provider = "local"
+min_score = 0.58
+text_with_voice_min = 0.42
+max_per_hour = 6
+max_per_day = 24
+
+[chat]
+max_messages_per_turn = 4
+max_chars_per_message = 120
+max_total_chars = 320
+message_delay_ms = 450
+
+# ---- 大肥鱼间聊天（T-0041：QQ 双 AI 私聊 + 渴望阈值）----
+# 只有 session_id == "qq:private:<peer_uin>" 进这个模式；其它账号、群聊、web
+# 会话一律走原路径。peer_uin 留空 = 功能完全关闭，不猜收件人、不按关键词触发。
+[ai_chat]
+enabled = false
+peer_uin = ""                  # 绑定的对方 QQ 号；留空即禁用
+peer_name = "大肥鱼"           # 对方是另一个大肥鱼（同名不同体），不是主人
+# 渴望阈值（0-1）：每发一条抬 threshold_step，沉默时按时间线性衰减；
+# desire >= 当前阈值才允许主动发下一条。硬顶/地板夹在 [floor, ceiling]。
+initial_threshold = 0.30
+threshold_step = 0.12
+threshold_floor = 0.15
+threshold_ceiling = 0.95
+# 衰减基准：每小时抹掉「50 条消息抬升量」的衰减速率，**不是硬限流**。
+# 派生量（不写进配置）：threshold_decay_per_minute
+#   = threshold_step * decay_messages_per_hour / 60 = 0.12 * 50 / 60 = 0.1/分钟
+# 含义：稳态可持续约 50 条/小时；短时爆发约 7 条（floor 0.15 -> ceiling 0.95）。
+# 代码里没有「到 50 条就拒发」的分支，已发条数只进审计与统计。
+decay_messages_per_hour = 50
+# 兜底止血开关：>0 时才用滑动 1 小时窗口硬拦己方条数；0 = 完全不拦（默认）。
+hard_cap_per_hour = 0
+# 阈值衰减到 <= 上次 desire 时再触发一次 LLM 探询的最小间隔（省 token）。
+probe_interval_minutes = 10
+quiet_hours = ["01:00", "08:00"]
+
+# ---- 自己做事（T-0052：自主动作的渴望阈值；动作在 L2/L3，本层只配好）----
+# 与 [ai_chat] **数学同源、状态完全独立**：state 键是 self_action:state:<scope>。
+# AI 之间聊得再多也不会抬高自主动作的阈值，反过来也一样。
+# 软限：没有「到数就拒发」的分支。decay_events_per_hour 只是「沉默一小时抹掉
+# 多少次动作的抬升量」，hard_cap_per_hour = 0 表示只软限、不硬拦。
+[self_action]
+enabled = true                 # 自主动作默认开；软限（阈值/静默/日上限）照旧生效，想关改 false
+initial_threshold = 0.35
+threshold_step = 0.10
+threshold_floor = 0.20
+threshold_ceiling = 0.90
+# 本域单位是「次动作」，不是「条消息」：
+# 派生 threshold_decay_per_minute = 0.10 * 30 / 60 = 0.05/分钟
+decay_events_per_hour = 30
+hard_cap_per_hour = 0          # 0 = 只软限，不硬拦
+daily_cap = 12                 # 每天自主动作次数兜底
+max_events_per_turn = 2        # 每轮自主动作上限（轮内总动作仍受 4 个约束）
+probe_interval_minutes = 30
+quiet_hours = ["01:00", "08:00"]
+
+# ---- 主动找主人（占位，本轮代码不接；T-0052）----
+# 目前「主动找主人」仍由 [chat].coax_desire_low/high 撒娇梯 + [activity] 预算决定。
+# 本段只是给未来迁到同一套软限留的位置：**改了不会有任何效果**。
+[owner_chat]
+enabled = false
+initial_threshold = 0.30
+threshold_step = 0.12
+threshold_floor = 0.15
+threshold_ceiling = 0.90
+decay_events_per_hour = 50
+hard_cap_per_hour = 0
+quiet_hours = ["01:00", "08:00"]
+
+[tts]
+enabled = true
+engine = "indextts25"
+cache_version = "v6-25"
+mode = "http_json"
+base_url = "http://127.0.0.1:9880/tts"
+format = "wav"
+text_lang = "zh"
+prompt_lang = "zh"
+ref_audio_path = ""            # 本机参考音频路径（wav），例：D:/voices/ref.wav
+prompt_text = ""              # 与 ref_audio_path 配套的参考音频转写
+text_split_method = "cut5"
+media_type = "wav"
+streaming_mode = false
+short_sentence_mode = true
+max_chars_per_sentence = 20
+min_chars_per_sentence = 4
+strip_stage_directions = true   # 念之前去掉（小声）（尾巴晃了一下），气泡里仍然显示
+stage_direction_max_chars = 24  # 超过这个长度、或含句末标点的括号按正文处理，不删
+stream_sentences = true
+# 语气与断句 —— 「听起来自不自然」几乎全部来自这两项，和参考音无关。
+# instruct_enabled: 服务端用 inference_instruct2 合成，语气真的会变；代价是参考音
+#   相似度略降（0.70~0.77 vs 0.79~0.81）、RTF 1.0→1.1~1.2。关掉 = 回到改动之前。
+# text_frontend:    断句交给模型自己的文本前端（按标点断、把「～」「……」念顺），
+#   而不是我们切碎再拼 —— 后者正是"断句听着不对"的来源。首次使用会加载 wetext。
+instruct_enabled = true
+text_frontend = true
+timeout_seconds = 120
+# api_key_env = "LOCAL_TTS_KEY"
+# [tts.headers]
+# X-Local-TTS = "1"
+
+[sticker]
+enabled = true
+library_dir = "stickers"
+comfyui_enabled = true
+comfyui_url = "http://127.0.0.1:8188"
+intent_threshold = 0.60              # 换 bge 向量后分数上移，0.60 才不会在普通对话里乱发图
+explicit_threshold = 0.20
+intent_backend = "hybrid"       # rules | llm | hybrid | kev (kev needs the 8009 server up)
+intent_max_tokens = 400
+intent_cooldown_seconds = 60.0
+base_generation_enabled = true
+# 只在用户明确要图（force）时允许现画；自发路径开着会让阈值失效。
+base_generation_spontaneous = false
+base_generation_max_chars = 12
+base_generation_max_per_10m = 3
+max_candidates = 30
+# 情绪闸门（0~5，0 = 关闭）。和 intent_threshold 正交：那个管图对不对，
+# 这个管这一刻值不值得配图。见 fatfish/sticker/emotion.py。
+min_emotion_intensity = 2.0
+
+# 向量后端与相似度锚点沿用 low.toml 的值（bge-base / 0.42~0.60）。
+# 只在这里覆盖 max_candidates：本 profile 给候选池放宽，前提是排序已经被
+# 真向量接管，否则 30 个候选里前 20 个就已经是噪声。
+
+[photo]
+enabled = true
+comfyui_url = "http://127.0.0.1:8188"
+comfyui_autostart = false
+# 本机路径请放 config.local.toml（不入库），写法见 config/example.toml。
+comfyui_python = ""
+comfyui_main = ""
+comfyui_cwd = ""
+models_root = ""
+unet = "anima-turbo-v1.1.safetensors"
+clip = "qwen_3_06b_base.safetensors"
+vae = "qwen_image_vae.safetensors"
+lora = "deepseek_whalegirl_v1.safetensors"
+lora_strength = 0.8
+steps = 8
+cfg = 1.0
+width = 1024
+height = 1024
+timeout_seconds = 300
+stop_comfyui_after = true
+unload_tts_before_start = true
+stop_tts_process = true
+restart_tts_after = true
+tts_idle_unload_seconds = 300
+min_free_vram_mb = 7000
+
+# CosyVoice3-0.5B / Qwen3-TTS local server template (uncomment to use):
+# mode = "http_json"
+# base_url = "http://127.0.0.1:50000/inference_instruct"
+# voice = "your_speaker_id"
+# payload_template = '{"tts_text":"{text}","spk_id":"{voice}","instruct_text":"{emotion}"}'
+
+[life]
+enabled = true
+tick_seconds = 180
+sleep_start = "23:30"
+sleep_end = "08:00"
+default_energy = 75
+energy_decay_per_hour = 5.0
+reply_energy_cost = 2.0
+
+[wakeup]
+enabled = true
+min_delay_seconds = 60
+max_delay_days = 7
+max_per_day = 12
+max_chain_depth = 4
+proactive_min_interval_minutes = 60
+quiet_hours_min_confidence = 0.90
+
+[bilibili]
+enabled = false
+read_only = true
+cookie_path = "bilibili_cookies.json"
+user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+request_interval_seconds = 1.0
+max_videos_per_day = 12
+# Read-only comment retrieval for each video; 0 = comment reading disabled (no comments requested).
+comments_per_video = 10
+max_comments_per_day = 0
+max_private_messages_per_day = 0
+
+
+[qzone]
+# QQ空间读路径。enabled 门控后台轮询与写路径（见下方写路径块，boss 授权 2026-10-25 激活）；
+# CLI `fatfish qzone fetch` 不受限。
+enabled = true
+read_only = false
+cookie_path = "qzone_cookies.json"
+# 主人自己的 QQ 号；留空时用 cookie 里的 uin 作为主人身份（决定 author_scope/origin_scope）。
+owner_uin = ""
+# 轮询间隔分钟；运行时下限 clamp 到 30。T-0025 起 30 分钟：采集节奏与决策轮同步。
+poll_interval_minutes = 30
+max_feed_items_per_poll = 20
+# Number of embedded comments extracted from each post's response (read-only, zero additional requests); 0 = no extraction.
+comments_per_item = 5
+# 好友动态默认不进提示词（外部 LLM 是泄露面）。true 时对话内互动可引用（仍 wrap_untrusted）。
+friends_content_to_llm = false
+# 好友动态端点单独失败时是否降级为 partial（不计熔断连续失败）。
+# false = feeds 失败照常计入连续失败（默认，行为不变）；夜间实测档在 night-test.toml 打开。
+feeds_optional = false
+request_interval_seconds = 1.0
+timeout_seconds = 10.0
+# 「看看我空间动态」旁路一次最多注入的本地动态条数。
+review_max_items = 10
+# ---- 写路径（说说发布；boss 授权 2026-10-25：分享欲模型，ADR-0005）----
+# desire ≥ 阈值（默认 0.7）跳过审批直接发布；低于阈值/缺省进审批箱等主人批。
+auto_post_desire_threshold = 0.7
+# 一天最多发布条数（含已排队名额）；0 = 不限制（boss 明示不限次），>0 才生效。
+max_posts_per_day = 0
+# 草稿是否必须人工审批（web/CLI）。false 时由 desire 阈值决定是否跳过审批；
+# 仍受配额（若 >0）与安静时段（23:30-08:00 顺延）约束。
+require_approval = false
+# 单条说说内容长度上限（字符）；超出部分截断。
+content_max_chars = 2000
+# 安静时段（本地时间 HH:MM）：入队发布顺延到时段结束。
+quiet_hours_start = "23:30"
+quiet_hours_end = "08:00"
+
+# ---- 私聊分享（T-0012 v3：share_to_friend，ADR-0006）----
+# 她能主动私聊的对象只有主人（share_with_owner）与 owner_bindings 好友位
+# 绑定的姐姐（share_to_friend），别无他人；收件人由绑定行解析，不可配置绕过。
+[share]
+# 每天主动私聊姐姐的上限；0 = 不限制。计数走 decision_log（kind=friend_share）。
+max_to_friend_per_day = 2
+# 安静时段（本地时间 HH:MM）：顺延到时段结束再发。
+quiet_hours_start = "23:30"
+quiet_hours_end = "08:00"
+
+# ---- 30 分钟自主决策轮（T-0025）：采集层持续跑，决策层每 interval_minutes 一次 LLM 决策 ----
+# 详见 docs/branches/activity.md。安静时段只跳过决策轮；键含义见 low.toml [activity] 注释。
+[activity]
+enabled = true
+interval_minutes = 30
+quiet_hours_start = "23:30"
+quiet_hours_end = "08:00"
+max_llm_turns_per_day = 48
+bili_browse_interval_minutes = 120
+bili_browse_limit = 3
+share_recency_hours = 6
+session_prefix = "activity"
+menu_max_items = 8
+idle_marker = "休息"
+ledger_path = "logs/activity-{date}.jsonl"
+
+[qq]
+enabled = false
+ws_url = "ws://127.0.0.1:3001"
+access_token_env = "QQ_ACCESS_TOKEN"
+self_id = 0
+private_whitelist = []
+group_whitelist = []
+group_reply_mode = "mention"   # mention | name | all | off
+group_cooldown_seconds = 90
+group_max_per_hour = 6
+bot_names = ["大肥鱼", "鲸鱼娘"]
+max_message_chars = 2000
+
+[relationship]
+enabled = true
+session_id = "default"
+morning_greeting = "08:30"
+night_checkin = "22:30"
+neglect_days = 3
+owner_claim_code = ""          # empty disables remote /认主 claim; prefer `fatfish owner bind`
+owner_display_name = "主人哥哥"
+
+[style]
+# 与 low.toml 保持一致：主人 2026-10-30 要求 emoji 不限量（-1），黑名单清空。
+# （-1 = 不限量；0 仍然是全删，严肃场合照旧全删。）
+emoji_mode = "light"          # off | light | medium
+max_emoji_per_message = -1
+max_kaomoji_per_message = -1
+allow_kaomoji = true
+emoji_blacklist = []
+
+[storage]
+db_path = "data/fatfish.db"
+archive_dir = "archive"
+backup_dir = "backups"

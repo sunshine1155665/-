@@ -1,0 +1,29 @@
+[Unit]
+Description=NapCat supervisor (exponential backoff; stops when the login token is dead)
+After=network-online.target docker.service
+Wants=network-online.target
+# 容器由 napcat.sh 拉起；这里只负责"掉线后按退避重启，凭据失效就停手"。
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/opt/fatfish/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/fatfish/.venv/bin/python /opt/fatfish/scripts/napcat_supervisor.py \
+    --uin ${QQ_UIN} \
+    --start-command "docker start napcat" \
+    --stop-command "docker stop napcat" \
+    --log-command "docker logs -f --tail 0 napcat" \
+    --scan-timeout 900 \
+    --log-dir /opt/fatfish/data/logs
+# 需要人工扫码时脚本会以 2 退出；on-failure 会让 systemd 立刻拉起，
+# 那就失去"停手"的意义了，所以只对异常退出重启。
+Restart=on-failure
+RestartSec=60
+# 退出码 2/3 是「需要人工」与「重启用尽」，必须当成正常停手。
+# 2026-10-31 事故：这里原来只写了 0，exit 2 被 on-failure 当成失败，
+# 每 60 秒拉起一次，整夜每 20 分钟撞一轮登录（一天 60+ 次）。
+SuccessExitStatus=0 2 3
+
+[Install]
+WantedBy=multi-user.target

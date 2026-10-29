@@ -1,0 +1,9 @@
+# Core has no mandatory third-party dependencies.
+# Optional environment check:
+psutil>=5.9
+# Optional lightweight voice matrix / Edge TTS:
+edge-tts>=7.0
+# Optional QQ / OneBot v11 adapter (NapCat forward WebSocket):
+websocket-client>=1.7
+# Optional Bilibili QR PNG output (the QR URL still prints without it):
+qrcode>=7.4

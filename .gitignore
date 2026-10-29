@@ -1,0 +1,54 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --- virtualenvs (several per-engine) ---
+.venv/
+venv/
+.venv-*/
+
+# --- local-only data, models, vendored engines ---
+data/
+*.db
+*.db-wal
+*.db-shm
+models/
+vendor/
+checkpoints/
+dist/
+
+# --- build/runtime artifacts ---
+# 音频只限定在 data/ 下忽略；assets/voice/ 里的复刻参考音频要入库。
+data/**/*.wav
+*.zip
+*.log
+data/run/
+served.html
+headers.txt
+
+# --- 多 agent 任务看板（本机共享，不入库；要跨机同步再放开）---
+.agent-board/
+
+# --- 本地 agent 工作区与个人评审稿（绝不入库）---
+.zcode/
+.workbuddy/
+staging/
+memory_v6_review_*.md
+scripts/send_continue.*
+.opencode/
+opencode.jsonc
+
+# --- 本机覆盖配置（含真实路径/QQ，不入库；示例见 config/example.toml）---
+config.local
+config.local.toml
+
+# --- secrets ---
+.env
+
+# --- editors / OS ---
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini

@@ -1,0 +1,31 @@
+[Unit]
+Description=fatfish web (online tier)
+Documentation=file:/opt/fatfish/docs/adr/0012-online-tier.md
+After=network-online.target docker.service
+Wants=network-online.target
+# 崩溃循环时别把 2 vCPU 的经济型实例拖死：5 次之后停下等人看。
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=fatfish
+Group=fatfish
+WorkingDirectory=/opt/fatfish
+EnvironmentFile=/opt/fatfish/.env
+Environment=PYTHONUTF8=1
+Environment=PYTHONIOENCODING=utf-8
+# token 走 EnvironmentFile（FATFISH_WEB_TOKEN），不要写进 ExecStart：ps 能看到。
+ExecStart=/opt/fatfish/.venv/bin/python -m fatfish --profile cloud serve --host 127.0.0.1 --port 8765
+Restart=always
+RestartSec=5
+MemoryHigh=600M
+MemoryMax=750M
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/fatfish/data
+
+[Install]
+WantedBy=multi-user.target

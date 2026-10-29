@@ -1,0 +1,19 @@
+[Unit]
+Description=NapCat QR one-click setup page (tailnet only)
+Documentation=file:/opt/fatfish/docs/runbooks/napcat-qr-phone.md
+After=network-online.target napcat-qr-mcp.service
+Wants=network-online.target napcat-qr-mcp.service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/opt/fatfish/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/fatfish/.venv/bin/python /opt/fatfish/scripts/napcat_qr_setup.py \
+    --host 127.0.0.1 \
+    --port 9452
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
