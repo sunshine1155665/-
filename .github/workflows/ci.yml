@@ -22,6 +22,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
     timeout-minutes: 45
+    env:
+      # windows runner 是英文 locale（cp1252）：CLI 输出与测试打印的中文在
+      # 管道上会触发 UnicodeEncodeError。强制 UTF-8 模式（README 目标环境
+      # 的中文 Windows 默认 cp936 可编码中文，故本地复现不出来）。
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
 
