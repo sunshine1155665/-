@@ -16,7 +16,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "soulx"))
 
-import song_v2 as s2  # noqa: E402
+try:
+    import song_v2 as s2  # noqa: E402
+except ImportError:  # pragma: no cover - song_v2 依赖 numpy（唱歌 venv）
+    raise unittest.SkipTest("song_v2 needs numpy (singing venv only)")
 
 KNOBS = ("rate_scale", "vibrato", "vibrato_hz", "drift_cents", "scoop",
          "breath", "air", "reverb", "backing_db", "legato")

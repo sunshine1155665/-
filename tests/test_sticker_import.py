@@ -18,6 +18,12 @@ from fatfish.sticker.importer import (
 )
 from fatfish.sticker.service import StickerService
 
+try:
+    from PIL import Image  # noqa: F401
+    HAVE_PIL = True
+except ImportError:  # pragma: no cover - 可选依赖
+    HAVE_PIL = False
+
 
 def png_bytes(width: int = 1, height: int = 1, rgb: tuple[int, int, int] = (255, 0, 0)) -> bytes:
     """Build a tiny, valid PNG without Pillow."""
@@ -156,6 +162,7 @@ class StickerImportTests(unittest.TestCase):
         kwargs.update(overrides)
         return import_stickers(self.service, llm, **kwargs)
 
+    @unittest.skipUnless(HAVE_PIL, "需要 Pillow 读取图片尺寸")
     def test_iter_images_dedupes_and_skips_invalid(self) -> None:
         first = write_png(self.incoming / "a.png", (255, 0, 0))
         write_png(self.incoming / "b.png", (255, 0, 0))  # identical content
@@ -298,6 +305,7 @@ class StickerImportTests(unittest.TestCase):
         self.assertFalse(result["vision_used"])
         self.assertTrue(result["needs_review"])
 
+    @unittest.skipUnless(HAVE_PIL, "需要 Pillow 读取图片尺寸")
     def test_vision_rejection_uses_text_metadata_fallback(self) -> None:
         image = write_png(self.incoming / "happy_cat.png")
         llm = FakeLLM(reject_images=True)

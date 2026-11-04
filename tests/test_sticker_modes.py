@@ -89,7 +89,10 @@ class _NoLLM:
 
 
 def base_png(path: Path) -> str:
-    from PIL import Image
+    try:
+        from PIL import Image
+    except ImportError:  # pragma: no cover - Pillow 为可选依赖
+        raise unittest.SkipTest("Pillow not installed (optional dependency)")
 
     Image.new("RGB", (64, 64), (30, 60, 90)).save(path)
     return str(path)

@@ -6,7 +6,10 @@ import sys
 import unittest
 from pathlib import Path
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - numpy 只存在于唱歌/引擎 venv
+    raise unittest.SkipTest("numpy not installed (singing venv only)")
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "soulx"))
