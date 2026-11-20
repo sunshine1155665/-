@@ -1,0 +1,45 @@
+# 夜间实测档（2026-10-25 批准）：只在显式 --config 时加载，绝不进默认 profile。
+#   python scripts/night_test.py run --config config/night-test.toml
+# 与 low/standard 的差异只有两块：[qzone] 放开测试需要的开关、[night_test] 驱动参数。
+# 其余全部继承所选 profile（--profile 或 FATFISH_PROFILE，默认 low）。
+
+[qzone]
+# 夜间测试放宽（boss 2026-10-25 批准）：
+# enabled      —— 允许采集（驱动用 manual=True 显式采集，不依赖后台 tick）
+# read_only    —— 允许起草说说（post_qzone 只建草稿，绝不直接发布）
+# require_approval —— 草稿必须人工审批；夜间无人审批，所以夜里只积草稿、绝不真发
+# poll_interval_minutes —— 名义轮询间隔；驱动每 30 分钟显式采一次，值保持一致
+# friends_content_to_llm —— 允许引用好友动态原文（仅测试档放开；main 默认 false，
+#                证据仍走 wrap_untrusted，凭证形态字符串有 redact 兜底）
+# feeds_optional —— 好友动态端点（feeds3/mobile list）失败只降级 partial，不计熔断：
+#                夜间实测端点还在校准（mobile list 曾被 -4003 拒），不能让一个
+#                端点把整晚采集熔断停掉；emotions 也失败仍算真失败。
+enabled = true
+read_only = false
+require_approval = true
+poll_interval_minutes = 30
+friends_content_to_llm = true
+feeds_optional = true
+
+[night_test]
+# 驱动（scripts/night_test.py）专用参数；profile/产品代码不读这一节。
+interval_minutes = 30          # 两轮唤醒的标称间隔（03:00–08:00 恰好 10 轮）
+jitter_minutes = 3             # 每轮唤醒时刻 ±N 分钟抖动
+start = "03:00"                # 夜间窗口开始（本地时间）；boss 2026-10-25 定稿
+end = "08:00"                  # 夜间窗口结束；到点硬停（窗口不跨零点，逻辑仍兼容跨零点）
+wake_token_budget = 1000000    # 每轮硬顶（turn_traces 的 prompt+completion）；明确不做全晚总闸
+bilibili_videos_per_wake = 1   # 每轮 browse_once 拉的新视频上限
+review_items_per_wake = 10     # 「看看空间动态」旁路一次注入的本地动态条数（覆写 qzone.review_max_items）
+session_prefix = "night"       # 会话 id = night-YYYYMMDD-wNN
+ledger_path = "data/logs/night-test-{date}.jsonl"   # 台账，{date}=YYYYMMDD
+stop_file = "data/run/night-test.stop"              # 放这个文件 = 下一轮前硬停
+consecutive_failure_limit = 3  # 连续 N 轮「采集+轮次全失败」则熔断
+# 唤醒轮文本：命中「空间里」触发既有 qzone review 旁路（注入本地动态证据）；
+# 刻意避开表情包/拍照/负面关键词，引导只 remember / post_qzone / schedule_wakeup / 闲聊。
+wake_text = "夜间自主活动时间。看看空间里有什么新动态，B站也转一下；想记的事用 remember，值得分享的用 post_qzone 起草说说（要审批，明早主人看），没有值得一提的就随便聊两句。"
+
+# ---- 自主决策轮（T-0025）：夜间实测期间关闭 ----
+# night_test 驱动有自己的 30 分钟唤醒循环；两个循环同跑会双重消耗预算、
+# 双写台账。白天行为不受影响（night-test.toml 只在实测时叠加）。
+[activity]
+enabled = false

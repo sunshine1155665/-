@@ -1,0 +1,54 @@
+# 部署专用覆盖（示例）——复制成 config/cloud.local.toml 再改。
+#
+# 这个文件放「跟这台机器 / 这个 tailnet 绑定的值」，不进仓库、不跟着代码升级走。
+# 合并顺序：low.toml < cloud.toml < cloud.local.toml（后者优先级最高）。
+# systemd 通过 `--config /opt/fatfish/config/cloud.local.toml` 加载。
+#
+# bootstrap.sh 会在这个文件不存在时自动复制一份；默认是纯文字（tts.enabled=false），
+# 想开语音就把下面的值填上。
+
+[tts]
+enabled = false
+# 家里 Windows 上先跑：
+#   tailscale serve --bg --https=9443 http://127.0.0.1:9880
+# 再把主机名换成你自己 `tailscale status` 里那台机器的名字：
+# base_url = "https://<你的主机名>.<你的tailnet>.ts.net:9443/tts"
+# 家里没开机时不要卡整轮对话；失败会自动退回文字。
+# 探针不用另配：[remote] enabled 在 cloud.toml 里默认就是 true，
+# 会从这个 base_url 自动推导 scheme://host:port/health（见 ops.md 降级矩阵）。
+timeout_seconds = 20
+
+[voice]
+# 开语音时一起改成 true；纯文字部署保持 false。
+enabled = false
+
+# 拍照（T-0068）：图在家里那台有显卡的机器上画，云上只负责转发与保存。
+# cloud.toml 里的 remote_url 是占位名，不改就会每次拍照都判成「家里不在」
+# （Tailscale 名字解析失败 → home_offline，只回一句话，不卡流程）。
+# 家里先起 photo_server（随 T-0068 第二段落地的 scripts/photo_server.py，
+# 默认监听 9946），再用 tailscale serve 暴露成 https：
+#   tailscale serve --bg --https=9446 http://127.0.0.1:9946
+# [photo]
+# remote_url = "https://<你的主机名>.<你的tailnet>.ts.net:9446"
+# remote_token_env = "PHOTO_SERVER_TOKEN"   # 与家里 photo_server 的 --token-env 同名
+# remote_timeout_seconds = 180   # ComfyUI 冷启动 30–120s；比本机的 300s 短，
+#                                # 是为了「等不到就赶紧退回文字」。
+
+# 唱歌（T-0067）：歌词在云上组，歌在家里那台机器上渲染，云端只收 wav 存盘。
+# cloud.toml 里 sing.remote_url 也是占位名，不改就每次点歌都判成「家里不在」
+# （只回一句文字，不会等满 420s）。家里先起 sing_server：
+#   python scripts/sing_server.py --host 127.0.0.1 --port 9945 \
+#          --token-env SING_SERVER_TOKEN --timeout 420
+# 再让 tailscale serve 提供 TLS（别直接 --host 0.0.0.0，token 会裸奔）：
+#   tailscale serve --bg --https=9445 http://127.0.0.1:9945
+# 两端必须用同一个 token 值：家里 SING_SERVER_TOKEN，云上同一个环境变量。
+#[sing]
+#remote_url = "https://<你的主机名>.<你的tailnet>.ts.net:9445"
+#remote_token_env = "SING_SERVER_TOKEN"   # 与家里 sing_server 的 --token-env 同名
+#remote_timeout_seconds = 420   # 等于家里 --timeout；客户端会自动多等 30s，
+#                               # 好让家里自己超时的 504 先回来
+
+# 贴纸语义检索（可选）：家里 9881 起来后把 cloud.toml 的 hash 覆盖掉。
+# [sticker]
+# embedding_backend = "http"
+# embedding_url = "https://<你的主机名>.<你的tailnet>.ts.net:9444/embed"

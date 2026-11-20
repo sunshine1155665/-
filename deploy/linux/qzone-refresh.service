@@ -1,0 +1,23 @@
+[Unit]
+Description=QQ Zone cookie refresh (headed Chromium under Xvfb; qzone rejects真无头)
+Documentation=https://github.com/  # 见 docs/adr/0011-qzone-browser-renew.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=fatfish
+Group=fatfish
+WorkingDirectory=/opt/fatfish
+EnvironmentFile=/opt/fatfish/.env
+Environment=PYTHONUNBUFFERED=1
+# QQ 空间会拒绝 --headless=new（2026-10-29 实测），所以这里必须给一个
+# 虚拟显示 + 有头 Chromium；窗口会被挪到屏幕外。
+Environment=DISPLAY=:99
+ExecStart=/usr/bin/xvfb-run -a --server-args="-screen 0 1280x900x24" \
+    /opt/fatfish/.venv/bin/python -m fatfish --profile cloud qzone refresh --timeout 180
+# refresh 失败时退出码非 0；不要重试风暴，交给下一次 timer。
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

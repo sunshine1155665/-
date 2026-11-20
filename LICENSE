@@ -1,0 +1,38 @@
+# Fatfish Personal Use License (Non-Commercial, Source-Available)
+
+版本 / Version: 1.0  
+适用项目 / Project: fatfish / 大肥鱼  
+版权 / Copyright: 2026 fatfish contributors
+
+## 中文
+
+本项目以“源码可读、个人使用”的方式提供，不是 OSI 认可的开源许可证。
+
+1. **允许**：个人、学习、研究、 hobby 性质的安装、运行、复制和修改；可以为自己或朋友搭建非商业实例。
+2. **允许**：在非商业目的下分发修改后的源码，但必须保留本许可证、版权声明和原项目链接，并显著说明你做了修改。
+3. **不允许**：商业使用、付费托管、作为付费产品或服务的一部分、批量售卖、以本项目名义接单或引流变现，除非事先取得版权持有者的书面许可。
+4. **不允许**：移除或规避身份内核、安全边界或本许可证；本项目本身不包含加密或 DRM，源码与数据保持可读。
+5. **第三方依赖**：Python 标准库及其他第三方组件仍适用各自的许可证；本许可证不改变、也不替代它们。仓库中不包含第三方参考项目的源码、模型权重或个人媒体。
+6. **无担保**：软件按“现状”提供，不提供任何明示或暗示的担保，包括适销性、特定用途适用性和不侵权担保。使用风险由使用者自行承担。
+7. **无关联**：本许可证不授予任何商标、品牌、角色形象或与上游项目存在官方关联的权利。本项目不代表 OpenCode、DeepSeek、Bilibili、QQ 或任何第三方。
+8. **替换**：作者保留在未来版本中更换许可证的权利；已经发布的版本仍按发布时的许可证执行。你可以在自己的衍生项目中改用其他许可证，但需自行确认不违反上述条款。
+
+## English
+
+This project is source-available for personal use. It is **not** an OSI-approved open-source license.
+
+1. **Allowed**: personal, educational, research and hobby use, including installation, running, copying and modification, and non-commercial instances for yourself or friends.
+2. **Allowed**: redistributing modified source for non-commercial purposes, provided this license, the copyright notice and the original project link are kept, and your changes are clearly marked.
+3. **Not allowed**: commercial use, paid hosting, inclusion in a paid product or service, resale, contract work or monetization under this project's name, without prior written permission from the copyright holder.
+4. **Not allowed**: removing or circumventing the identity kernel, security boundaries or this license. The project itself contains no encryption or DRM; source and data remain readable.
+5. **Third-party dependencies**: Python's standard library and other third-party components keep their own licenses. This license does not replace them. The repository does not include third-party reference projects, model weights or personal media.
+6. **No warranty**: the software is provided "as is", without any express or implied warranty, including merchantability, fitness for a particular purpose and non-infringement. You use it at your own risk.
+7. **No affiliation**: this license grants no trademark, brand, character-image or official-affiliation rights. This project is not affiliated with OpenCode, DeepSeek, Bilibili, QQ or any other third party.
+8. **Replacement**: the author may change the license for future releases; already published versions remain under the license they shipped with. You may use another license for your own derivative work, provided you comply with the terms above.
+
+---
+
+如果你需要商业使用，请先联系版权持有者取得书面许可。  
+For commercial use, contact the copyright holder for written permission first.
+
+如果你希望改用别的许可证，可以整体替换本文件；请保留原项目的版权与来源说明。

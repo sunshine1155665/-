@@ -1,0 +1,12 @@
+{
+  "name": "fatfish-whale-pet-shell",
+  "version": "0.1.0",
+  "private": true,
+  "main": "main.js",
+  "description": "Local Live2D whale-girl desktop shell for fatfish",
+  "dependencies": {
+    "electron": "^45.3.2",
+    "pixi-live2d-display": "^0.4.0",
+    "pixi.js": "^6.5.10"
+  }
+}

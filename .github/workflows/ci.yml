@@ -1,0 +1,46 @@
+name: CI
+
+# 全量测试套件离线、无需显卡、无需模型权重（见 README「无引擎也能跑」）。
+# Windows 是开发/验收环境（必过门）；Linux 是观察腿（README 只承诺纯聊天/Web
+# 可跑 Linux，测试在 Linux 尚未验证——先攒信号，不挡合并）。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
+    timeout-minutes: 45
+    env:
+      # windows runner 是英文 locale（cp1252）：CLI 输出与测试打印的中文在
+      # 管道上会触发 UnicodeEncodeError。强制 UTF-8 模式（README 目标环境
+      # 的中文 Windows 默认 cp936 可编码中文，故本地复现不出来）。
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install optional deps
+        run: python -m pip install -r requirements.txt
+
+      - name: Smoke (argparse-level, no config needed)
+        run: python -m fatfish --help
+
+      - name: Run offline test suite
+        run: python -m unittest discover -s tests -p "test_*.py"

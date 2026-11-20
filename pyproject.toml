@@ -1,0 +1,44 @@
+[build-system]
+# setuptools>=61 is the floor for PEP 621 ``[project]`` + ``package-data`` in
+# pyproject; 64 is the floor for ``[tool.setuptools.packages.find]`` include
+# patterns. The box ships setuptools 65.5.0, so the pin stays <= that: a
+# higher floor would force an upgrade that cannot happen offline.
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fatfish"
+# Single source of truth: fatfish/__init__.py:__version__ (read statically by
+# setuptools, no import side effects). Never also write a literal here.
+dynamic = ["version"]
+description = "Low-profile personal companion core: memory, life state, wakeups, stickers."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+doctor = ["psutil>=5.9"]
+vector = ["numpy>=1.26"]
+keepalive = ["urllib3>=2.0"]
+tts-edge = ["edge-tts>=7.0"]
+qq = ["websocket-client>=1.7"]
+bilibili = ["qrcode>=7.4"]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.dynamic]
+version = { attr = "fatfish.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["fatfish*"]
+
+# Non-.py runtime resources. Without these the wheel installs a package whose
+# db.py SCHEMA_PATH and lexicon SEED_PATH point at files that do not exist, so
+# ``ensure_schema()`` raises FileNotFoundError on first run.
+# Wildcards, not file-by-file lists: new *.sql / *.json drop in untouched.
+[tool.setuptools.package-data]
+fatfish = ["*.sql", "*.json"]
+"fatfish.lexicon" = ["*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

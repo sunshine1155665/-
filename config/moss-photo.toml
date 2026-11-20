@@ -1,0 +1,12 @@
+# moss-photo profile：只把「照相」换成魔搭云端 LoRA，聊天仍走 low 的 OpenCode Go。
+#
+# 合并顺序 low.toml < moss-photo.toml；这里只覆盖 [photo].mode。
+# 用法：
+#   FATFISH_PROFILE=moss-photo python -m fatfish chat --session owner "拍张照"
+# 模型 id / 触发词 / key 全部继承 low.toml 的 [photo] modelscope_* 配置。
+
+[app]
+profile = "moss-photo"
+
+[photo]
+mode = "modelscope"

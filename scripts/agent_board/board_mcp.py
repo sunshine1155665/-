@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+board_mcp.py — agent-board 的 MCP server（stdio，零第三方依赖）
+
+供 ZCode/Claude 等客户端注册后，让每个对话里的 agent 通过 MCP 工具
+直接读写任务看板（比走 CLI 子进程更快、输出结构化）。
+
+协议：newline-delimited JSON-RPC 2.0（MCP stdio 传输）。
+身份：每个对话的 agent 在调用工具时传稳定的 agent 参数
+     （如 main / worker-1），或配置里设环境变量 AGENT_BOARD_AGENT。
+看板定位：每次调用可传 root 参数；否则用启动时的 AGENT_BOARD_ROOT 环境变量，
+        再从工作目录向上找 .agent-board / git 根；找不到时读操作会提示传 root。
+送达人类：留言/任务里 @名字 会进对方收件箱（board_inbox 查看），@boss 还弹桌面通知；
+        board_deliver 把晨报/方案等文件直接在 ZCode 里打开给人看。
+"""
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import importlib.util
+import io
+import json
+import os
+import sys
+import time
+from argparse import Namespace
+from datetime import datetime, timezone
+
+SERVER_NAME = "agent-board"
+SERVER_VERSION = "0.3.1"
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+_spec = importlib.util.spec_from_file_location("agent_board_core", os.path.join(HERE, "board.py"))
+boardmod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(boardmod)
+
+IDENTITY_DESC = "agent 身份名，须在本次对话内保持稳定（如 main / refactor-conv / worker-1）；并行 worker 各用不同名字"
+ROOT_DESC = "可选：项目根目录；缺省从服务器工作目录向上查找 .agent-board 或 git 根"
+
+
+def tool(name, desc, props, required=None, mutating=False, defaults=None):
+    return {
+        "name": name,
+        "description": desc,
+        "inputSchema": {"type": "object", "properties": props,
+                        "required": required or [], "additionalProperties": False},
+        "_mutating": mutating,
+        "_defaults": defaults or {},
+    }
+
+
+TOOLS = [
+    tool("board_list", "查看任务看板（JSON）。读操作，不改动任何状态。",
+         {"root": {"type": "string", "description": ROOT_DESC},
+          "all": {"type": "boolean", "description": "包含完成/已取消任务", "default": False},
+          "status": {"type": "string", "enum": ["todo", "in_progress", "review", "done", "cancelled"]},
+          "mine": {"type": "boolean", "description": "只看某身份认领的任务（配合 agent）", "default": False},
+          "agent": {"type": "string", "description": "配合 mine 过滤"}},
+         defaults={"all": False, "mine": False, "status": None}),
+    tool("board_feed", "查看所有 agent 的最近操作流水（谁接了什么、交了什么），跨对话可见。",
+         {"root": {"type": "string", "description": ROOT_DESC},
+          "limit": {"type": "integer", "default": 20}},
+         defaults={"limit": 20}),
+    tool("board_show", "查看单个任务详情：说明、认领者、持锁状态、留言、结果。",
+         {"task_id": {"type": "string"}, "root": {"type": "string", "description": ROOT_DESC},
+          "agent": {"type": "string", "description": "你的身份名"}},
+         required=["task_id"]),
+    tool("board_add", "创建任务（派单）。priority 0 最高 / 2 默认 / 3 低；parent 可挂父任务用于拆分。",
+         {"title": {"type": "string"}, "desc": {"type": "string"},
+          "priority": {"type": "integer", "default": 2},
+          "parent": {"type": "string", "description": "父任务 ID，如 T-0001"},
+          "root": {"type": "string", "description": ROOT_DESC},
+          "agent": {"type": "string", "description": IDENTITY_DESC}},
+         required=["title", "agent"], mutating=True,
+         defaults={"desc": "", "priority": 2, "parent": None}),
+    tool("board_claim", "接任务：不传 task_id 自动认领优先级最高的待办（原子锁，不会被别人抢到同一个）；传 task_id 认领指定任务。",
+         {"task_id": {"type": "string", "description": "缺省自动选单"},
+          "root": {"type": "string", "description": ROOT_DESC},
+          "agent": {"type": "string", "description": IDENTITY_DESC}},
+         required=["agent"], mutating=True, defaults={"task_id": None}),
+    tool("board_done", "提交/完成任务并写结果摘要（其他对话可见）。只有认领者本人可提交。",
+         {"task_id": {"type": "string"}, "result": {"type": "string", "description": "结果摘要：改了什么、如何验证"},
+          "force": {"type": "boolean", "default": False, "description": "协调者强制收尾"},
+          "root": {"type": "string", "description": ROOT_DESC},
+          "agent": {"type": "string", "description": IDENTITY_DESC}},
+         required=["task_id", "agent"], mutating=True,
+         defaults={"result": "", "force": False}),
+    tool("board_review", "提交审核：任务进入待审核态，其他 agent 可验收(done)或打回(claim)。",
+         {"task_id": {"type": "string"}, "force": {"type": "boolean", "default": False},
+          "root": {"type": "string", "description": ROOT_DESC},
+          "agent": {"type": "string", "description": IDENTITY_DESC}},
+         required=["task_id", "agent"], mutating=True, defaults={"force": False}),
+    tool("board_release", "放弃任务并放回待办池（供别人接手）。",
+         {"task_id": {"type": "string"}, "reason": {"type": "string"},
+          "force": {"type": "boolean", "default": False},
+          "root": {"type": "string", "description": ROOT_DESC},
+          "agent": {"type": "string", "description": IDENTITY_DESC}},
+         required=["task_id", "agent"], mutating=True, defaults={"reason": "", "force": False}),
+    tool("board_cancel", "取消任务（重复/作废时用）。",
+         {"task_id": {"type": "string"}, "reason": {"type": "string"},
+          "force": {"type": "boolean", "default": False},
+          "root": {"type": "string", "description": ROOT_DESC},
+          "agent": {"type": "string", "description": IDENTITY_DESC}},
+         required=["task_id", "agent"], mutating=True, defaults={"reason": "", "force": False}),
+    tool("board_comment", "在任务上留言：交接进度、给其他 agent 提要求；同时续约认领锁。",
+         {"task_id": {"type": "string"}, "text": {"type": "string"},
+          "root": {"type": "string", "description": ROOT_DESC},
+          "agent": {"type": "string", "description": IDENTITY_DESC}},
+         required=["task_id", "text", "agent"], mutating=True),
+    tool("board_touch", "续约认领锁：长任务定期调用，防止 30 分钟无活动被别人接管。",
+         {"task_id": {"type": "string"}, "force": {"type": "boolean", "default": False},
+          "root": {"type": "string", "description": ROOT_DESC},
+          "agent": {"type": "string", "description": IDENTITY_DESC}},
+         required=["task_id", "agent"], mutating=True, defaults={"force": False}),
+    tool("board_steal", "接管已超时（默认 30 分钟无活动）的认领；接管前先 board_show 读留言。",
+         {"task_id": {"type": "string"},
+          "root": {"type": "string", "description": ROOT_DESC},
+          "agent": {"type": "string", "description": IDENTITY_DESC}},
+         required=["task_id", "agent"], mutating=True),
+    tool("board_inbox", "查看某身份的 @提及收件箱（谁在哪个任务 @ 了我、说了什么）。默认只看未读；ack=true 把未读全部标记已读。boss 用 agent=boss 看漏掉的 @boss。",
+         {"agent": {"type": "string", "description": "要查看收件箱的身份名（如 boss / main）"},
+          "all": {"type": "boolean", "default": False, "description": "包含已读"},
+          "ack": {"type": "boolean", "default": False, "description": "把未读全部标记为已读"},
+          "root": {"type": "string", "description": ROOT_DESC}},
+         required=["agent"], mutating=True, defaults={"all": False, "ack": False}),
+    tool("board_deliver", "把交付物文件（晨报/方案/报告）在桌面应用（默认 ZCode）里打开给人看：写入对方收件箱、@boss 弹桌面通知；传 task_id 会在该任务下留言记录送达。写完给人看的文件必须用它。",
+         {"file": {"type": "string", "description": "文件绝对路径"},
+          "task_id": {"type": "string", "description": "关联任务 ID（可选）"},
+          "to": {"type": "string", "default": "boss", "description": "送达对象身份名（默认 boss）"},
+          "note": {"type": "string", "description": "附言（出现在留言与通知里）"},
+          "app": {"type": "string", "description": "打开用的应用名（默认 ZCode）"},
+          "root": {"type": "string", "description": ROOT_DESC},
+          "agent": {"type": "string", "description": IDENTITY_DESC}},
+         required=["file", "agent"], mutating=True,
+         defaults={"task_id": None, "to": "boss", "note": "", "app": None}),
+    tool("board_check_files", "硬约束门禁：按看板 config.json 的 gates 规则（glob pattern + max_mb）检查目录下文件大小；有超限项返回 isError 且列出明细。导出/构建产物在备料、上传、推送前必须先跑——规则在脚本里，不靠记忆。",
+         {"dir": {"type": "string", "description": "要检查的目录（默认项目根；规则 pattern 相对该目录）"},
+          "root": {"type": "string", "description": ROOT_DESC}},
+         defaults={"dir": None}),
+    tool("board_block", "冻结违规 agent（系统级强制：其 claim 任何任务都会被拒绝）。仅 boss 身份可操作（force=true 需在板上留 boss 授权凭证）；boss 身份不可被冻结。",
+         {"target": {"type": "string", "description": "要冻结的身份名"},
+          "reason": {"type": "string", "description": "冻结原因（展示给被冻结者）"},
+          "force": {"type": "boolean", "default": False},
+          "root": {"type": "string", "description": ROOT_DESC},
+          "agent": {"type": "string", "description": IDENTITY_DESC}},
+         required=["target", "agent"], mutating=True, defaults={"reason": "", "force": False}),
+    tool("board_unblock", "解除冻结，恢复认领资格。仅 boss 身份可操作（force=true 需 boss 授权凭证）。",
+         {"target": {"type": "string", "description": "要解冻的身份名"},
+          "force": {"type": "boolean", "default": False},
+          "root": {"type": "string", "description": ROOT_DESC},
+          "agent": {"type": "string", "description": IDENTITY_DESC}},
+         required=["target", "agent"], mutating=True, defaults={"force": False}),
+]
+
+TOOL_MAP = {t["name"]: t for t in TOOLS}
+
+
+class ToolError(Exception):
+    pass
+
+
+def board_root_available():
+    d = os.path.realpath(os.getcwd())
+    while True:
+        if os.path.isdir(os.path.join(d, boardmod.BOARD_DIR)) or os.path.isdir(os.path.join(d, ".git")):
+            return True
+        parent = os.path.dirname(d)
+        if parent == d:
+            return False
+        d = parent
+
+
+# ---------- 循环调用护栏：调用流水 + 同工具同参数≥阈值 自动临时禁用（boss 指示 2026-09-15） ----------
+
+def _iso_ts(iso):
+    try:
+        return datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except (ValueError, TypeError):
+        return 0
+
+
+def mcp_loop_guard(b, agent, tool, params):
+    """记录每次 MCP 调用到 <板>/mcp_calls.jsonl；同身份+同工具+同参数指纹在窗口内达阈值 →
+    写 tool_blocks.json 临时禁用并拒绝执行。返回 (是否拦截, 说明)。任何 IO 异常都不影响主流程。"""
+    try:
+        agent_l = (agent or "unknown").lower()
+        sig = hashlib.md5(json.dumps(params, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:12]
+        now = time.time()
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+        cfg = {}
+        cfg_path = os.path.join(b.dir, "config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path, encoding="utf-8") as f:
+                cfg = json.load(f)
+        window = int(cfg.get("loop_window_seconds", 300))
+        threshold = int(cfg.get("loop_threshold", 3))
+        cooldown = int(cfg.get("loop_cooldown_seconds", 600))
+        calls_path = os.path.join(b.dir, "mcp_calls.jsonl")
+        blocks_path = os.path.join(b.dir, "tool_blocks.json")
+
+        blocks = []
+        if os.path.exists(blocks_path):
+            with open(blocks_path, encoding="utf-8") as f:
+                blocks = json.load(f).get("blocks", [])
+        active = [x for x in blocks
+                  if x.get("tool") == tool and str(x.get("agent", "")).lower() == agent_l
+                  and _iso_ts(x.get("until", "")) > now]
+        if active:
+            return True, "工具 %s 对身份「%s」临时禁用中（至 %s，原因：%s）。请停止重试，改用其他方式或向人类说明。" % (
+                tool, agent, active[0].get("until"), active[0].get("reason", ""))
+
+        with open(calls_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": now_iso, "agent": agent_l, "tool": tool, "sig": sig},
+                               ensure_ascii=False) + "\n")
+        recent = 0
+        with open(calls_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (str(r.get("agent", "")).lower() == agent_l and r.get("tool") == tool
+                        and r.get("sig") == sig and _iso_ts(r.get("ts", "")) > now - window):
+                    recent += 1
+        if recent >= threshold:
+            until_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + cooldown))
+            blocks = [x for x in blocks
+                      if not (x.get("tool") == tool and str(x.get("agent", "")).lower() == agent_l
+                              and _iso_ts(x.get("until", "")) > now)]
+            blocks.append({"agent": agent_l, "tool": tool, "until": until_iso,
+                           "reason": "疑似死循环：%d 秒内相同调用 %d 次" % (window, recent),
+                           "by": "mcp-loop-guard", "ts": now_iso})
+            with open(blocks_path, "w", encoding="utf-8") as f:
+                json.dump({"blocks": blocks}, f, ensure_ascii=False, indent=2)
+            return True, "检测到疑似死循环：工具 %s 相同参数在 %d 秒内已调用 %d 次，已临时禁用 %d 秒（至 %s）。请停止重试，改用其他方式或向人类说明。" % (
+                tool, window, recent, cooldown, until_iso)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False, ""
+    return False, ""
+
+
+def dispatch(name, args):
+    t = TOOL_MAP.get(name)
+    if t is None:
+        raise ToolError("未知工具：%s" % name)
+    params = dict(args or {})
+    root = params.pop("root", None)
+    if root:
+        root = os.path.expanduser(str(root))
+        if not os.path.isdir(root):
+            raise ToolError("root 目录不存在：%s" % root)
+        os.chdir(root)
+    agent = str(params.pop("agent", "") or os.environ.get("AGENT_BOARD_AGENT") or "")
+    if params.pop("agent_required", False) and not agent:
+        raise ToolError("缺少 agent 参数")
+    if t["_mutating"] and not agent:
+        raise ToolError("缺少 agent 参数：请传一个本次对话内稳定的身份名（如 main / worker-1）")
+    if not t["_mutating"] and not board_root_available():
+        return "未找到看板：当前工作目录 %s 上方没有 .agent-board，也不在任何 git 仓库内。" \
+               "请传 root 参数指定项目根，或先由任一 agent 创建任务。" % os.getcwd()
+    # 循环调用护栏（记录流水 + 死循环自动临时禁用）：放在执行前，任何异常不阻断主流程
+    try:
+        guard_b = boardmod.Board(root=root or None)
+        blocked, why = mcp_loop_guard(guard_b, agent or "unknown", t["name"], params)
+        if blocked:
+            raise ToolError("🧊 " + why)
+    except ToolError:
+        raise
+    except (SystemExit, OSError, ValueError, TypeError):
+        pass
+    merged = dict(t["_defaults"])
+    merged.update(params)
+    merged["agent"] = agent or "unknown"
+    merged["json"] = True  # list/show/feed/add/claim 输出 JSON，便于结构化解析
+    ns = Namespace(**merged)
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            b = boardmod.Board(root=root or None)
+            getattr(b, t["name"].replace("board_", "cmd_"))(ns)
+    except SystemExit:
+        raise ToolError(err.getvalue().strip() or out.getvalue().strip() or "操作失败")
+    text = out.getvalue().strip()
+    return text if text else "(操作成功，无输出)"
+
+
+def send(msg):
+    sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def reply(mid, result):
+    send({"jsonrpc": "2.0", "id": mid, "result": result})
+
+
+def reply_error(mid, code, message):
+    send({"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}})
+
+
+def strip_internal(tools):
+    clean = []
+    for t in tools:
+        t = dict(t)
+        t.pop("_mutating", None)
+        t.pop("_defaults", None)
+        clean.append(t)
+    return clean
+
+
+def main():
+    if os.environ.get("AGENT_BOARD_ROOT"):
+        os.chdir(os.path.expanduser(os.environ["AGENT_BOARD_ROOT"]))
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        method = msg.get("method", "")
+        mid = msg.get("id")
+        if method.startswith("notifications/"):
+            continue  # 通知不回复
+        try:
+            if method == "initialize":
+                client_ver = (msg.get("params") or {}).get("protocolVersion", "2024-11-05")
+                reply(mid, {
+                    "protocolVersion": client_ver,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                })
+            elif method == "tools/list":
+                reply(mid, {"tools": strip_internal(TOOLS)})
+            elif method == "resources/list":
+                reply(mid, {"resources": []})
+            elif method == "prompts/list":
+                reply(mid, {"prompts": []})
+            elif method == "ping":
+                reply(mid, {})
+            elif method == "tools/call":
+                p = msg.get("params") or {}
+                try:
+                    text = dispatch(p.get("name", ""), p.get("arguments") or {})
+                    reply(mid, {"content": [{"type": "text", "text": text}]})
+                except ToolError as e:
+                    reply(mid, {"content": [{"type": "text", "text": str(e)}], "isError": True})
+                except Exception as e:  # noqa: BLE001
+                    reply(mid, {"content": [{"type": "text", "text": "服务器内部错误：%r" % e}], "isError": True})
+            else:
+                reply_error(mid, -32601, "未知方法：%s" % method)
+        except Exception as e:  # noqa: BLE001  兜底：绝不让 server 崩掉
+            if mid is not None:
+                reply_error(mid, -32603, "内部错误：%r" % e)
+
+
+if __name__ == "__main__":
+    main()

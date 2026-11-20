@@ -1,0 +1,38 @@
+# modelscope profile：LLM 走魔搭（ModelScope）API-Inference。
+#
+# 合并顺序 low.toml < modelscope.toml；这里只覆盖 [llm]，其余全部继承 low。
+# 用途：换一条国内直连的 OpenAI 兼容线路（2026-11-12 实测 /v1/models 0.3s），
+# 也给 OpenCode Go 之外留一个可切换的 provider。
+#
+# 用法（key 只进 .env，别提交）：
+#   MODELSCOPE_API_KEY=ms-...
+#   FATFISH_PROFILE=modelscope python -m fatfish doctor
+#   FATFISH_PROFILE=modelscope python -m fatfish ...
+#
+# 实测（2026-11-12，本机电信网络）：
+#   Qwen/Qwen3.8-Flash-Next   一句话约 1.7s，可用
+#   Qwen/Qwen3.8-27B          一句话约 1.5s，可用
+#   ZhipuAI/GLM-5.2           可用（GLM-4.7-Flash 曾 429 拥挤）
+#   deepseek-ai/*、MiniMax/*、moonshotai/* 在 /v1/models 列表里，但当前 token
+#   调用返回 "has no provider supported"；换模型前先用 curl 试一条再改这里。
+#
+# reasoning_effort = "off"：ModelScope 的兼容层不保证认这个字段，关掉即不进
+# 请求体；Qwen 自带 reasoning_content，关掉也照样思考，只是不再额外传参。
+
+[app]
+profile = "modelscope"
+
+[llm]
+provider = "modelscope"
+base_url = "https://api-inference.modelscope.cn/v1"
+model = "Qwen/Qwen3.8-Flash-Next"
+api_key_env = "MODELSCOPE_API_KEY"
+api_style = "chat_completions"
+send_session_header = false   # x-opencode-session 只对 OpenCode 有意义
+reasoning_effort = "off"
+timeout_seconds = 90
+
+# 这个 profile 同时把「照相」切到魔搭云端 LoRA（低显存机器很合适）。
+# 只切拍照、保留 OpenCode 聊天的话用 FATFISH_PROFILE=moss-photo。
+[photo]
+mode = "modelscope"

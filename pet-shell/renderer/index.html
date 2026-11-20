@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>鲸鱼娘</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="dragbar" title="拖动我"><span>🐋 鲸鱼娘</span><span class="hint" id="conn">连接中…</span></div>
+  <div id="controls">
+    <button id="zoomOut" title="缩小">－</button>
+    <span id="zoomLabel">100%</span>
+    <button id="zoomIn" title="放大">＋</button>
+    <span id="sizeLabel"></span>
+    <label id="opacityLabel" title="窗口不透明度">
+      透明
+      <input id="opacity" type="range" min="20" max="100" value="100" />
+    </label>
+  </div>
+  <div id="stage"></div>
+  <div id="bubble" class="bubble hidden"></div>
+  <div id="inputbar">
+    <input id="msg" type="text" maxlength="300" placeholder="跟鲸鱼娘说点什么…" autocomplete="off" />
+    <button id="send" type="button">发送</button>
+  </div>
+
+  <script src="../assets/vendor/live2dcubismcore.min.js"></script>
+  <script src="../assets/vendor/pixi.min.js"></script>
+  <script src="../assets/vendor/cubism4.min.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>

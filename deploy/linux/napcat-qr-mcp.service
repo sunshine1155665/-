@@ -1,0 +1,22 @@
+[Unit]
+Description=NapCat login QR over MCP (Streamable HTTP)
+Documentation=file:/opt/fatfish/docs/runbooks/napcat-qr-phone.md
+After=network-online.target docker.service
+Wants=network-online.target
+# 只监听 127.0.0.1；对外 HTTPS 由 tailscale serve 提供，绝不开放公网端口。
+# 需要 root：工具会在掉线时 systemctl start napcat-supervisor / docker inspect。
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/opt/fatfish/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/fatfish/.venv/bin/python /opt/fatfish/scripts/napcat_qr_mcp.py \
+    --host 127.0.0.1 \
+    --port 9451 \
+    --token-env NAPCAT_QR_MCP_TOKEN
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

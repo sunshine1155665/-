@@ -1,0 +1,22 @@
+[Unit]
+Description=NapCat / OneBot watchdog (alert only, never restarts the container)
+Documentation=file:/opt/fatfish/docs/branches/ops.md
+After=network-online.target docker.service
+Wants=network-online.target
+# 本服务不常驻：由 napcat-watch.timer 每 2 分钟拉起一次 `--once`。
+# 只 enable timer，不要 enable 这个 service。
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/fatfish
+EnvironmentFile=/opt/fatfish/.env
+ExecStart=/opt/fatfish/.venv/bin/python /opt/fatfish/scripts/napcat_watch.py --once
+# 退出码语义（脚本自己定义）：
+#   0 = 本轮健康
+#   1 = 本轮不健康（含未满 grace 的抖动；告警仍然只在翻转时发一次）
+#   2 = 配置错误
+# 1 不需要 Restart：下一轮 timer 会再跑，状态（首次故障时间）在
+# data/run/napcat-watch.json 里，跨进程不会断。
+# 掉线期间这里持续 failed 是有意的：`systemctl --failed` 就是第二重提醒。
+Restart=no

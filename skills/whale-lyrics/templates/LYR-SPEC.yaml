@@ -1,0 +1,48 @@
+# LYR-SPEC：先填这张表，再写词
+title: ""
+brief: ""            # 一句话：这首歌在干什么（安慰/邀功/撒娇/道歉/邀请）
+addressee: ""        # 对谁说；此刻关系状态
+anchor: ""           # 一个能看见的具体物/身体部位
+turn: ""             # 第 4 句怎么回到锚点/他
+length_curve: ""     # 如 8-7-6-10；3–6 句，5–11 字/句
+rhyme: "ABCB"        # 默认 2/4 押；第 3 句可故意不押
+rhyme_family: ""     # 十三辙，如 言前 / 遥条 / 江阳
+particle_budget: 2   # 全歌语气词上限
+
+# 每句一个功能；允许 3–6 句
+beats:
+  - line: 1
+    function: "观察"
+    stress: []       # 2–4 个重音词，实词
+    notes: 0         # 已有旋律时填该句音符数；没有就 0
+  - line: 2
+    function: "动作"
+    stress: []
+    notes: 0
+  - line: 3
+    function: "转折/邀请"
+    stress: []
+    notes: 0
+  - line: 4
+    function: "落点"
+    stress: []
+    notes: 0
+
+# 声调风险：只标每句最高音、句首、≥5 半音大跳落点
+tone_notes: []
+# - line: 2
+#   position: "句首"
+#   char: "今"
+#   tone: 1
+#   risk: "一声从低处大跳进入"
+
+deliberate_breaks:
+  rhyme_change: false   # 第 3 句换辙？
+  new_entity_last: false # 第 4 句引入新名词？
+  reason: ""
+
+adaptation:
+  target_chars: 36      # 当前管线；未来可去掉
+  removed: []           # 删了哪些语气词/修饰语
+  added: []             # 加了哪些衬字
+  reason: ""

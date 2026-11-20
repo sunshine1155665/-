@@ -1,0 +1,76 @@
+# =====================================================================
+# config/example.toml —— 需要用户自填的键汇总（值全部留空，仅供复制）
+# ---------------------------------------------------------------------
+# 用法：把需要的键复制进你自己的覆盖文件（建议命名 config.local.toml，
+# 已被 .gitignore 忽略，不会入库），启动时加：
+#   python -m fatfish --config config.local.toml serve
+# 或在 .env 里填对应的环境变量（见 .env.example）。
+# profile 的加载顺序：config/low.toml < 选定 profile < --config 指定的文件。
+# =====================================================================
+
+# ---------- LLM（必填其一，否则走内置本地兜底回复） ----------
+# 密钥不放 toml：写进 .env 的环境变量（默认就是下面这两个名字）。
+[llm]
+# provider = "opencode_go"                     # 内置 provider，见 docs/branches/runtime.md
+# base_url = "https://opencode.ai/inference/go/openai/v1"
+# model = "deepseek-v4.1-flash"
+# api_key_env = "FATFISH_OPENCODE_KEY"         # 指向 .env 里的变量名
+
+# ---------- QQ / NapCat（要接 QQ 才填） ----------
+[qq]
+# enabled = true
+# ws_url = "ws://127.0.0.1:3001"               # NapCat 正向 WebSocket
+# access_token_env = "QQ_ACCESS_TOKEN"         # token 写进 .env，不要写在这里
+# self_id = 0                                  # 机器人的 QQ 号（可选，0=自动）
+
+# ---------- 官方 QQ Bot（与 NapCat 二选一；云端常用） ----------
+[qqbot]
+# enabled = true
+# app_id_env = "QQBOT_APPID"                   # 凭据只放 .env
+# app_secret_env = "QQBOT_SECRET"
+# group_enabled = false
+# require_mention = true
+
+# ---------- QQ 空间（要读/写空间才填） ----------
+[qzone]
+# owner_uin = ""                               # 主人的 QQ 号；其余好友 cookie 见 .env QZONE_FRIEND_UINS
+
+# ---------- TTS（IndexTTS-2.5，要语音才填） ----------
+[tts]
+# enabled = true
+# ref_audio_path = ""                          # 本机参考音频 wav 的绝对路径
+# prompt_text = ""                             # 与参考音频配套的转写文本
+
+# ---------- 拍照（ComfyUI，要生图才填；四件套都要） ----------
+[photo]
+# enabled = true
+# mode = "modelscope"                          # local | modelscope | remote
+# modelscope_model = "sunny1155665/whalegirl-moss-v2"
+# modelscope_api_key_env = "MODELSCOPE_API_KEY"
+# comfyui_url = "http://127.0.0.1:8188"
+# comfyui_autostart = false                    # true 时用下面三项自动拉起 ComfyUI
+# comfyui_python = ""                          # ComfyUI 专用 venv 的 python.exe
+# comfyui_main = ""                            # ComfyUI 的 main.py
+# comfyui_cwd = ""                             # ComfyUI 工作目录
+# models_root = ""                             # ComfyUI 模型根目录（diffusion_models 等的父目录）
+# unet = "anima-turbo-v1.1.safetensors"        # 换任意人物 LoRA/模型时同步改这四行
+# clip = "qwen_3_06b_base.safetensors"
+# vae = "qwen_image_vae.safetensors"
+# lora = "deepseek_whalegirl_v1.safetensors"   # 鲸鱼娘 LoRA（来源见 THIRD_PARTY_NOTICES.md）
+
+# ---------- 表情包生成（魔搭 LoRA，要发表情包才填） ----------
+[sticker]
+# generation_enabled = true
+# generation_model = "Qwen/Qwen-Image-2.1-Turbo"
+# generation_loras = ["sunny1155665/whalegirl-sticker-v1"]
+# generation_trigger = "whalegirl_sticker"
+# modelscope_api_key_env = "MODELSCOPE_API_KEY"
+
+# ---------- 唱歌（YuE2 → RVC，要点歌才填） ----------
+[sing]
+# enabled = true
+# python = ".venv-soulx/Scripts/python.exe"    # 唱歌专用 venv
+# script = "soulx/song_yue2_rvc.py"
+# semitones = 0
+# timeout_seconds = 720
+# 外部路径走环境变量：YUE2_ROOT / RVC_ROOT / RVC_PTH / RVC_INDEX

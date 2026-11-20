@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh the QQ Zone session every 12h (免扫码续期)
+Documentation=https://github.com/  # 见 docs/adr/0011-qzone-browser-renew.md
+
+[Timer]
+# 每天 06:10 / 18:10 各一次；上一轮没跑完不会叠加（oneshot）。
+OnCalendar=*-*-* 06,18:10:00
+# 刚开机时补一次。
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target
