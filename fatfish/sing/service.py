@@ -1,18 +1,20 @@
-"""On-demand singing: one SoulX render per request, serialized on the 8 GB card.
+"""On-demand singing: one YuE2→RVC render per request, serialized on the 8 GB card.
 
 Design constraints
 ------------------
-* The application itself stays stdlib-only: the voice model lives in
-  ``.venv-soulx`` and is invoked as a subprocess (``soulx/song_v2.py``).
+* The application itself stays stdlib-only: the singing models live in
+  ``.venv-soulx`` / ``.venv-train`` and are invoked as subprocesses
+  (``soulx/song_yue2_rvc.py`` by default).
 * One song at a time.  A second concurrent request returns ``busy`` instead of
   queueing unbounded GPU work.  The lease is process-wide and, via a file lock
   in ``data/run``, shared between the web and QQ processes.
-* TTS and SoulX cannot both hold the card.  Before rendering we take the same
+* TTS and the singer cannot both hold the card.  Before rendering we take the same
   ``vram.lock`` the photo service uses, cooperatively unload TTS and, once the
   song is written, reload it in ``finally`` (also on failure/timeout).
-* The lyrics never come from the network here.  The model may pass four short
-  lines; invalid lyrics fall back to the shipped persona song instead of
-  failing the turn, and the reason is recorded on the job row.
+* The lyrics never come from the network here.  The model may pass a complete
+  song (4–16 sung lines, optional section tags); invalid lyrics fall back to
+  the shipped persona song instead of failing the turn, and the reason is
+  recorded on the job row.
 * No arbitrary shell: the only process spawned is the configured python +
   script pair.
 
@@ -24,7 +26,7 @@ home ``scripts/sing_server.py``, which owns the card and the TTS handoff.  The
 cloud still writes its own ``sing_jobs`` row and its own ``data/songs/<id>``
 copy, so QQ/Web delivery is unchanged.
 
-A remote failure must not cost the user 420 seconds of silence.  Before the
+A remote failure must not cost the user 600 seconds of silence.  Before the
 POST we do a 2s TCP probe: unreachable -> ``home_offline`` immediately (text
 only), same idea as the TTS capability probe.  The render itself is bounded by
 ``sing.remote_timeout_seconds``, which sits ~30s above the server's own render
@@ -53,14 +55,14 @@ from ..db import Database
 from ..process_lock import acquire, lock_path
 
 # ``Runtime`` is built per chat turn in the web process, so an instance lock is
-# not enough: two turns could both start SoulX.  The module lock covers this
+# not enough: two turns could both start a render.  The module lock covers this
 # process, the file lock covers the QQ process as well.
 _PROCESS_JOB_LOCK = threading.Lock()
 
 DEFAULT_EMOTIONS = ("soft", "genki", "sad")
-#: Server-side render budget (scripts/sing_server.py --timeout).  One song is
-#: 1-3 minutes; 7 minutes is the "something hung" line.
-DEFAULT_REMOTE_TIMEOUT = 420.0
+#: Server-side render budget (scripts/sing_server.py --timeout).  YuE2→RVC
+#: takes ~5-6 minutes; 10 minutes is the "something hung" line.
+DEFAULT_REMOTE_TIMEOUT = 600.0
 #: The client waits a little longer than the server so a server-side timeout
 #: arrives as JSON instead of a client-side socket timeout.
 REMOTE_TIMEOUT_GRACE = 30.0
@@ -68,8 +70,18 @@ REMOTE_TIMEOUT_GRACE = 30.0
 DEFAULT_REMOTE_CONNECT_TIMEOUT = 2.0
 _MIN_WAV_BYTES = 44
 _MIN_LINE_CHARS = 4
-_MAX_LINE_CHARS = 14
-_LINES_REQUIRED = 4
+_MAX_LINE_CHARS = 16
+#: ADR-0018: ``lyrics`` is a *complete* song now, not a fixed four-liner.
+#: 4–16 sung lines matches what YuE2 full generation handles well (the 16-line
+#: 2:07 birthday song rendered fine; more risks truncation).
+_MIN_SUNG_LINES = 4
+_MAX_SUNG_LINES = 16
+#: Section tags the model may use to structure a full song.  Anything else in
+#: brackets is treated as a sung line (and will fail the length/count checks).
+SECTION_TAGS = frozenset(
+    {"verse", "chorus", "bridge", "intro", "outro", "hook", "refrain",
+     "pre-chorus", "prechorus"}
+)
 _ANSI_RE = None
 
 
@@ -129,13 +141,15 @@ def friendly_sing_error(code: str) -> str:
     if code.startswith("python_missing"):
         return "唱歌的运行环境没装好（.venv-soulx 找不到）。"
     if code.startswith("script_missing"):
-        return "唱歌脚本不在（soulx/song_v2.py）。"
+        return "唱歌脚本不在（soulx/song_yue2_rvc.py）。"
     if code.startswith("lyrics_src_missing"):
         return "歌词底稿不在，这次唱不了。"
     if code.startswith("missing_assets"):
-        return "唱歌要用的参考音/元数据缺了，先去检查 data/soulx。"
+        return "唱歌要用的模型/资源缺了，先去检查 renderer 配置。"
     if code == "render_timeout":
         return "这首歌录到一半超时了，等下再点一次。"
+    if code == "memory_not_enough":
+        return "现在内存/显存有点紧，先不唱了，等会儿再点一次。"
     if code.startswith("render_failed"):
         return "这次没唱好，等下再点一次。"
     if code == "sing_storage_error":
@@ -154,8 +168,22 @@ def friendly_sing_error(code: str) -> str:
     return "这次没唱成，等下再点一次。"
 
 
+def is_section_tag(line: str) -> bool:
+    """``"[Chorus]"`` -> True; anything else in brackets is a sung line."""
+    text = line.strip()
+    if not (text.startswith("[") and text.endswith("]") and len(text) > 2):
+        return False
+    return text[1:-1].strip().lower().replace(" ", "") in SECTION_TAGS
+
+
 def clean_lyrics(raw: Any) -> tuple[list[str], str]:
-    """Return ``(lines, error)``; empty lines mean "sing the default song"."""
+    """Return ``(lines, error)``; empty lines mean "sing the default song".
+
+    ADR-0018: ``lyrics`` carries a *complete* song — 4–16 sung lines of 4–16
+    characters each, optionally structured with ``[Verse]``/``[Chorus]`` tags.
+    The tags are kept in the returned lines (the renderer forwards them to
+    YuE2 verbatim) but do not count towards the sung-line budget.
+    """
     if raw is None or raw == "" or raw == []:
         return [], ""
     if isinstance(raw, str):
@@ -166,11 +194,12 @@ def clean_lyrics(raw: Any) -> tuple[list[str], str]:
         return [], "lyrics_bad_shape"
     lines = [" ".join(str(item or "").split()) for item in items]
     lines = [line for line in lines if line]
-    if len(lines) != _LINES_REQUIRED:
-        return [], "lyrics_need_four_lines"
+    sung = [line for line in lines if not is_section_tag(line)]
+    if not _MIN_SUNG_LINES <= len(sung) <= _MAX_SUNG_LINES:
+        return [], "lyrics_bad_count"
     if any(
         len(line) < _MIN_LINE_CHARS or len(line) > _MAX_LINE_CHARS
-        for line in lines
+        for line in sung
     ):
         return [], "lyrics_bad_length"
     return lines, ""
@@ -354,6 +383,19 @@ class SingService:
             )
             + REMOTE_TIMEOUT_GRACE,
         )
+        # Tailscale can be DERP-relayed: a raw TCP connect may take >2s even
+        # though the home service is healthy.  Keep the probe generous so it
+        # reports "offline" only when the box is really unreachable.
+        self.remote_connect_timeout = max(
+            1.0,
+            float(
+                config.get(
+                    "sing.remote_connect_timeout_seconds",
+                    DEFAULT_REMOTE_CONNECT_TIMEOUT,
+                )
+                or DEFAULT_REMOTE_CONNECT_TIMEOUT
+            ),
+        )
         token_env = str(config.get("sing.remote_token_env", "SING_SERVER_TOKEN") or "")
         self.remote_client = remote_client
         if self.remote_client is None and self.mode == "remote" and self.remote_url:
@@ -361,10 +403,11 @@ class SingService:
                 self.remote_url,
                 token=(env_secret(token_env) or "") if token_env else "",
                 timeout=self.remote_timeout,
+                connect_timeout=self.remote_connect_timeout,
             )
         self.emotion = str(config.get("sing.emotion", "soft") or "soft")
-        self.semitones = float(config.get("sing.semitones", 3.0))
-        self.timeout = max(10.0, float(config.get("sing.timeout_seconds", 300)))
+        self.semitones = float(config.get("sing.semitones", 0.0))
+        self.timeout = max(10.0, float(config.get("sing.timeout_seconds", 720)))
         self.min_free_vram_mb = max(
             0, int(config.get("sing.min_free_vram_mb", 5600))
         )
@@ -543,11 +586,18 @@ class SingService:
                     src = self.default_src
                     if lines:
                         src = job_dir / "lyrics.json"
+                        # ``lyrics`` keeps section tags for the renderer; the
+                        # 4-line default song only ever has ``phrases``.
                         src.write_text(
                             json.dumps(
                                 {
                                     "title": "点歌",
-                                    "phrases": [{"text": line} for line in lines],
+                                    "lyrics": lines,
+                                    "phrases": [
+                                        {"text": line}
+                                        for line in lines
+                                        if not is_section_tag(line)
+                                    ],
                                 },
                                 ensure_ascii=False,
                             ),
@@ -795,7 +845,7 @@ class SingService:
         return env
 
     def _ensure_vram(self) -> bool:
-        """Make room for SoulX, cooperatively unloading TTS if needed."""
+        """Make room for the singer, cooperatively unloading TTS if needed."""
         free = self._vram_free()
         if free is not None and free >= self.min_free_vram_mb:
             return True

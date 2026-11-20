@@ -276,25 +276,26 @@ class EmbeddingServiceTests(unittest.TestCase):
             return self.values.get(key, default)
 
     def test_hash_backend_does_not_start_the_service(self) -> None:
-        config = self.FakeConfig({"sticker.embedding_backend": "hash"})
+        config = self.FakeConfig({"memory.embedding_backend": "hash"})
         self.assertFalse(start_all.embedding_enabled(config))
 
     def test_http_backend_starts_it(self) -> None:
-        config = self.FakeConfig({"sticker.embedding_backend": "http"})
-        self.assertTrue(start_all.embedding_enabled(config))
-
-    def test_falls_back_to_the_memory_backend(self) -> None:
         config = self.FakeConfig({"memory.embedding_backend": "http"})
         self.assertTrue(start_all.embedding_enabled(config))
 
-    def test_missing_pieces_are_listed_not_raised(self) -> None:
+    def test_sticker_key_no_longer_starts_it(self) -> None:
+        # Sticker retrieval is gone; a leftover sticker.* key must not spawn 9881.
         config = self.FakeConfig({"sticker.embedding_backend": "http"})
+        self.assertFalse(start_all.embedding_enabled(config))
+
+    def test_missing_pieces_are_listed_not_raised(self) -> None:
+        config = self.FakeConfig({"memory.embedding_backend": "http"})
         missing, python = start_all.embedding_components(config)
         self.assertIsInstance(missing, list)
         self.assertIn("python", str(python).lower())
 
     def test_skipped_when_asked(self) -> None:
-        config = self.FakeConfig({"sticker.embedding_backend": "http"})
+        config = self.FakeConfig({"memory.embedding_backend": "http"})
         with tempfile.TemporaryDirectory() as tmp:
             child, pid_path = start_all.start_embedding(
                 config,
@@ -367,7 +368,7 @@ class ServiceRuntimeTests(unittest.TestCase):
 
     def test_hash_backend_does_not_start_the_embedding_service(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            runtime = self._runtime({"sticker.embedding_backend": "hash"}, tmp)
+            runtime = self._runtime({"memory.embedding_backend": "hash"}, tmp)
             with self.assertRaises(start_all.ControlError) as caught:
                 runtime.start("embedding")
         self.assertEqual("disabled", caught.exception.code)

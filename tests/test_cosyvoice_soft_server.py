@@ -246,6 +246,18 @@ class ServerTestCase(unittest.TestCase):
             daemon=True,
         )
         self.thread.start()
+        # Under a full unittest run the machine can be loaded enough that the
+        # first request races the server thread.  Wait for the listener before
+        # handing control to the test (the socket itself is already bound).
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", self.port), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.01)
+        else:
+            self.fail("cosyvoice test server did not start")
 
     def tearDown(self) -> None:
         self.service.close()
@@ -261,14 +273,21 @@ class ServerTestCase(unittest.TestCase):
         body: bytes | None = None,
         headers: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, str], bytes]:
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
-        try:
-            conn.request(method, path, body=body, headers=headers or {})
-            response = conn.getresponse()
-            data = response.read()
-            return response.status, dict(response.getheaders()), data
-        finally:
-            conn.close()
+        last: ConnectionError | None = None
+        for _ in range(2):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
+            try:
+                conn.request(method, path, body=body, headers=headers or {})
+                response = conn.getresponse()
+                data = response.read()
+                return response.status, dict(response.getheaders()), data
+            except ConnectionError as exc:  # reset/refused under heavy parallel load
+                last = exc
+                time.sleep(0.05)
+            finally:
+                conn.close()
+        assert last is not None
+        raise last
 
     def post_json(self, payload: Any) -> tuple[int, dict[str, str], bytes]:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")

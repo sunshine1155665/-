@@ -170,6 +170,28 @@ class MemoryService:
         )
         self.short_term_ttl_days = int(config.get("memory.short_term_ttl_days", 7))
         self.today_timeline_chars = int(config.get("memory.today_timeline_chars", 1200))
+        # 2026-11-18: forgetting-curve ranking.  Recency is a ranking signal,
+        # never a deletion rule: archived rows stay searchable with a penalty,
+        # and a genuinely exact hit gets a floor so old-but-right memories are
+        # never pushed out by fresh-but-irrelevant ones.
+        self.recency_weight = max(
+            0.0, float(config.get("memory.recency_weight", 0.15))
+        )
+        self.archived_score_multiplier = min(
+            1.0, max(0.1, float(config.get("memory.archived_score_multiplier", 0.8)))
+        )
+        self.exact_match_similarity_floor = min(
+            1.0, max(0.0, float(config.get("memory.exact_match_similarity_floor", 0.75)))
+        )
+        self.exact_match_recency_floor = min(
+            1.0, max(0.0, float(config.get("memory.exact_match_recency_floor", 0.6)))
+        )
+        self.archive_min_access_count = max(
+            0, int(config.get("memory.archive_min_access_count", 3))
+        )
+        self.archive_recent_access_days = max(
+            0.0, float(config.get("memory.archive_recent_access_days", 60))
+        )
         self.events = EventBuilder(db, config)
 
     @property
@@ -600,7 +622,8 @@ class MemoryService:
             rows = self.db.query(
                 "SELECT id FROM memory_items WHERE "
                 + where
-                + " ORDER BY importance DESC, observed_at DESC LIMIT ?",
+                + " ORDER BY CASE WHEN status='active' THEN 0 ELSE 1 END, "
+                "importance DESC, observed_at DESC LIMIT ?",
                 (*params, limit),
             )
             seen = set(ids)
@@ -634,7 +657,10 @@ class MemoryService:
         if include_forgotten:
             clauses.append("status<>'deleted'")
         else:
-            clauses.append("status='active'")
+            # Archived rows are old, not gone.  Keep them in the candidate
+            # pool and apply a score penalty below; a hard active-only filter
+            # used to make a true old match unreachable after compaction.
+            clauses.append("status IN ('active','archived')")
         if types:
             type_list = list(types)
             clauses.append("type IN (%s)" % ",".join("?" for _ in type_list))
@@ -676,6 +702,7 @@ class MemoryService:
         )
         params.append(scan_limit)
         now = time.time()
+        explicit_time = time_start is not None or time_end is not None
 
         def scored() -> Iterator[MemoryHit]:
             # Iterate the cursor one row at a time.  ``fetchall`` plus a list of
@@ -693,16 +720,32 @@ class MemoryService:
                 sim = cosine(qvec, item.embedding)
                 kw = self._keyword_score(qlower, item)
                 days = max(0.0, now - (item.last_accessed_at or item.observed_at)) / 86400.0
-                recency = math.exp(-days / 30.0)
+                # Forgetting curve: type/importance/access-scaled half-life.
+                # An explicit time window already ordered the candidates in
+                # time, so recency must not double-penalise that query.
+                if explicit_time:
+                    recency = 1.0
+                else:
+                    half_life = max(0.1, self._half_life_days(item))
+                    recency = math.exp(-math.log(2) * days / half_life)
+                exact = (
+                    sim >= self.exact_match_similarity_floor or kw >= 1.0
+                )
+                if exact:
+                    # A real hit must survive age and archival: floor only the
+                    # recency term, not the semantic/keyword strength.
+                    recency = max(recency, self.exact_match_recency_floor)
                 score = (
                     0.55 * sim
                     + 0.25 * item.importance
-                    + 0.10 * recency
+                    + self.recency_weight * recency
                     + 0.10 * item.confidence
                     + 0.10 * kw
                 )
                 if kw > 0:
                     score += 0.05
+                if item.status != "active" and not exact:
+                    score *= self.archived_score_multiplier
                 if score <= 0.05:
                     continue
                 yield MemoryHit(
@@ -710,7 +753,7 @@ class MemoryService:
                     score=round(score, 6),
                     similarity=round(sim, 6),
                     keyword=round(kw, 6),
-                    reason="semantic+importance+recency",
+                    reason="semantic+importance+recency+archive",
                 )
 
         hits = heapq.nlargest(max(1, int(limit)), scored(), key=lambda h: h.score)
@@ -1289,6 +1332,17 @@ class MemoryService:
         if item.type in {"persona", "prospective"}:
             return True
         if now - item.observed_at < 48 * 3600:
+            return True
+        # Spaced-repetition protection: memories that are actually recalled
+        # must not be archived just because they are old.  access_count and
+        # last_accessed_at are updated by search()'s _touch().
+        if item.access_count >= self.archive_min_access_count > 0:
+            return True
+        last_access = item.last_accessed_at or item.observed_at
+        if (
+            self.archive_recent_access_days > 0
+            and now - last_access < self.archive_recent_access_days * 86400.0
+        ):
             return True
         text = f"{item.gist} {item.summary} {' '.join(item.tags)}"
         if any(word in text for word in ("记住", "别忘", "重要", "承诺", "答应", "生日")):

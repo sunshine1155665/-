@@ -449,16 +449,44 @@ CREATE TABLE IF NOT EXISTS photo_jobs (
     created_at REAL NOT NULL,
     finished_at REAL,
     status TEXT NOT NULL DEFAULT 'running',
+    provider TEXT NOT NULL DEFAULT 'local',
+    task_id TEXT,
+    request_text TEXT NOT NULL DEFAULT '',
+    updated_at REAL,
     positive TEXT NOT NULL,
     negative TEXT NOT NULL DEFAULT '',
     caption TEXT NOT NULL DEFAULT '',
     prompt_source TEXT NOT NULL DEFAULT '',
     image_path TEXT,
     error TEXT,
-    comfyui_started INTEGER NOT NULL DEFAULT 0
+    comfyui_started INTEGER NOT NULL DEFAULT 0,
+    -- Schema v17: the inbound platform message id this photo answers.  The
+    -- async job outlives the HTTP turn, so the image outbox needs the id to
+    -- send as a passive reply (official QQ bot) instead of a proactive one.
+    reply_to TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_photo_jobs_created ON photo_jobs(created_at);
+
+-- Schema v16: async sticker generation (ModelScope LoRA submit -> tick poll ->
+-- image outbox).  The prompt lives here only, never in conversation/memory.
+CREATE TABLE IF NOT EXISTS sticker_jobs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    finished_at REAL,
+    status TEXT NOT NULL DEFAULT 'waiting',
+    provider TEXT NOT NULL DEFAULT 'modelscope',
+    task_id TEXT,
+    request_text TEXT NOT NULL DEFAULT '',
+    updated_at REAL,
+    prompt TEXT NOT NULL,
+    caption TEXT NOT NULL DEFAULT '',
+    image_path TEXT,
+    error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_sticker_jobs_created ON sticker_jobs(created_at);
 
 -- ---------------------------------------------------------------------------
 -- Schema v5: atomic details and evidence.

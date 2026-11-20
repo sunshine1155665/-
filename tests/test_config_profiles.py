@@ -41,8 +41,7 @@ def _overrides_over_low(profile: str) -> list[str]:
 
 class ProfileSnapshotTests(unittest.TestCase):
     def test_standard_overrides(self) -> None:
-        # Snapshot of standard.toml's effective changes vs low (2026-10-30,
-        # local paths in tts/photo deliberately emptied for the public release).
+        # Snapshot of standard.toml's effective changes vs low (2026-10-26).
         # Adding/removing an override is fine -- do it consciously, here too.
         self.assertEqual(
             _overrides_over_low("standard"),
@@ -54,33 +53,24 @@ class ProfileSnapshotTests(unittest.TestCase):
                 "decision.kev_timeout_seconds",
                 "life.default_energy",
                 "life.tick_seconds",
-                "llm.max_output_tokens",
                 "llm.timeout_seconds",
                 "memory.candidate_limit",
                 "memory.embedding_dim",
                 "memory.max_items_per_search",
-                "memory.nightly_voice_max_tokens",
                 "memory.rag_threshold",
                 "memory.rag_top_k",
                 "memory.recall_kev_threshold",
                 "memory.recall_threshold",
                 "memory.recall_top_k",
+                "photo.comfyui_autostart",
                 "photo.min_free_vram_mb",
                 "qq.enabled",
-                "sticker.comfyui_enabled",
-                "sticker.intent_cooldown_seconds",
-                "sticker.intent_threshold",
-                "sticker.max_candidates",
                 "tts.timeout_seconds",
-                "voice.max_per_day",
                 "voice.max_per_hour",
                 "voice.min_score",
                 "voice.provider",
                 "voice.text_with_voice_min",
                 "wakeup.max_chain_depth",
-                # 2026-11-01 config(wakeup) 把 low 的每日上限抬到 24；
-                # standard 仍是 12，所以 max_per_day 现在是真实 override。
-                "wakeup.max_per_day",
                 "wakeup.proactive_min_interval_minutes",
             ],
         )
@@ -103,29 +93,22 @@ class ProfileSnapshotTests(unittest.TestCase):
                 "memory.embedding_backend",
                 "memory.embedding_dim",
                 "memory.max_items_per_search",
-                "memory.nightly_voice_max_tokens",
                 "memory.rag_threshold",
                 "memory.rag_top_k",
                 "memory.recall_kev_threshold",
                 "memory.recall_threshold",
                 "memory.recall_top_k",
+                "photo.comfyui_autostart",
                 "photo.min_free_vram_mb",
                 "qq.enabled",
-                "sticker.comfyui_url",
-                "sticker.embedding_backend",
-                "sticker.similarity_ceil",
-                "sticker.similarity_floor",
                 "tts.base_url",
                 "tts.enabled",
                 "tts.mode",
                 "tts.timeout_seconds",
-                "voice.max_per_day",
                 "voice.max_per_hour",
                 "voice.min_score",
                 "voice.provider",
                 "voice.text_with_voice_min",
-                # 同 standard：low 上限 24，remote 12/90 是真实 override。
-                "wakeup.max_per_day",
                 "wakeup.proactive_min_interval_minutes",
             ],
         )
@@ -138,7 +121,6 @@ class ProfileSnapshotTests(unittest.TestCase):
             _overrides_over_low("cloud"),
             [
                 "app.profile",
-                "photo.mode",
                 "photo.remote_timeout_seconds",
                 "photo.remote_token_env",
                 "photo.remote_url",
@@ -152,33 +134,6 @@ class ProfileSnapshotTests(unittest.TestCase):
                 "sing.remote_timeout_seconds",
                 "sing.remote_token_env",
                 "sing.remote_url",
-                "sticker.embedding_backend",
-                "tts.enabled",
-                "voice.enabled",
-            ],
-        )
-
-    def test_cloud_overrides(self) -> None:
-        # cloud.toml 是「在线层」的最小覆盖层（ADR-0012）：只关掉必须 GPU
-        # 的能力，其余全部继承 low。和 standard/remote 同一规矩——新增覆盖
-        # 必须在这里同步，不能悄悄复制粘贴。
-        self.assertEqual(
-            _overrides_over_low("cloud"),
-            [
-                "app.profile",
-                "photo.mode",
-                "photo.remote_timeout_seconds",
-                "photo.remote_token_env",
-                "photo.remote_url",
-                "qzone.enabled",
-                "remote.enabled",
-                "remote.health_ttl_seconds",
-                "remote.timeout_seconds",
-                "sing.mode",
-                "sing.remote_timeout_seconds",
-                "sing.remote_token_env",
-                "sing.remote_url",
-                "sticker.embedding_backend",
                 "tts.enabled",
                 "voice.enabled",
             ],
@@ -193,41 +148,18 @@ class CloudProfileTests(unittest.TestCase):
         for key in (
             "tts.enabled",
             "voice.enabled",
-            "sing.enabled",
-            "photo.enabled",
             "qzone.enabled",
         ):
             self.assertFalse(config.get(key), key)
-        self.assertEqual(config.get("sticker.embedding_backend"), "hash")
-
-    def test_doctor_does_not_second_guess_the_online_tier(self) -> None:
-        from fatfish.doctor import _recommend
-
-        # 2C2G 的云主机上 doctor 不该提示「建议换成 low」。
-        self.assertEqual(_recommend(2 * 1024**3, "cloud"), "cloud")
-        self.assertEqual(_recommend(None, "cloud"), "cloud")
-
-
-class CloudProfileTests(unittest.TestCase):
-    """cloud = 在线层部署形态（ADR-0012），不是第四个资源档位。"""
-
-    def test_gpu_features_are_off(self) -> None:
-        config = load_config("cloud")
-        for key in (
-            "tts.enabled",
-            "voice.enabled",
-            "qzone.enabled",
-        ):
-            self.assertFalse(config.get(key), key)
-        self.assertEqual(config.get("sticker.embedding_backend"), "hash")
         # 唱歌是例外（T-0067）：云端不渲染，但走家里的 sing_server，所以
         # enabled 从 low 继承 true，真正决定「唱不唱得成」的是家里在不在。
         self.assertTrue(config.get("sing.enabled"))
         self.assertEqual(config.get("sing.mode"), "remote")
         self.assertTrue(str(config.get("sing.remote_url") or "").startswith("https://"))
-        # 拍照同理（T-0068）：云端没有 ComfyUI，图在家里画。
+        # 拍照（2026-11-15 boss：只用云端）：云上也直连 ModelScope API-Inference，
+        # 不再绕回家里 GPU；remote_* 键保留但只在改回 mode="remote" 时生效。
         self.assertTrue(config.get("photo.enabled"))
-        self.assertEqual(config.get("photo.mode"), "remote")
+        self.assertEqual(config.get("photo.mode"), "modelscope")
         self.assertTrue(str(config.get("photo.remote_url") or "").startswith("https://"))
         self.assertGreaterEqual(config.get("photo.remote_timeout_seconds"), 120)
         # 能力层探针默认开（T-0069）：云端唯一的「家里还在不在」判断依据。

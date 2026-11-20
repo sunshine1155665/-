@@ -102,7 +102,7 @@ class TTSClient:
         # text_frontend: 由模型自己的文本前端处理「～」「……」「、」和断句，
         #   而不是我们按 20 字硬切完再拼。实测长句更连贯（4.60s vs 5.02s），
         #   而且它管发音 —— 关掉会把「陪着」念成「背着」（mimo 听写确认）。
-        #   首次使用会加载 wetext（C:/Users/xu/.cache/modelscope/hub/pengzhendong/wetext）。
+        #   首次使用会加载 wetext（<HF_CACHE>/modelscope/hub/pengzhendong/wetext）。
         self.instruct_enabled = bool(config.get("tts.instruct_enabled", True))
         self.text_frontend = bool(config.get("tts.text_frontend", True))
         raw_template = config.get("tts.payload_template")

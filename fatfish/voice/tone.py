@@ -36,7 +36,7 @@
 
 from __future__ import annotations
 
-from ..sticker.emotion import emotion_intensity
+from .emotion import emotion_intensity
 from ..tts.instruct import normalize_tone
 
 # 情绪类的门槛（负向和正向都要过）。和表情包那道闸门同一个刻度 2.0：

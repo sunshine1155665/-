@@ -1,4 +1,4 @@
-"""On-demand singing (SoulX-Singer) with the shared VRAM lease."""
+"""On-demand singing (YuE2 -> RVC) with the shared VRAM lease."""
 
 from .service import (
     RemoteSingerClient,

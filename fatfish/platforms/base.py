@@ -47,6 +47,11 @@ class InboundMessage:
     # adapter resolves these to inline data URLs for vision-capable LLMs at
     # turn time; the bytes themselves are never persisted.
     images: list[str] = field(default_factory=list)
+    # Per-message context blocks the adapter wants on this turn only (quoted
+    # message, attachment stage directions, character/immersion hints). The
+    # runtime receives them as ``extra_evidence`` and never writes them to
+    # conversation history or long-term memory.
+    extra_evidence: list[str] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
 

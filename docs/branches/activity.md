@@ -3,7 +3,7 @@ title: 活动规划（QQ 动态 / B 站观看）
 type: branch
 status: active
 tags: [activity, qq-zone, bilibili, permissions, autonomy, scheduler, decision-turn]
-updated: 2026-10-25
+updated: 2026-11-18
 ---
 
 # 活动规划（QQ 动态 / B 站观看）
@@ -91,6 +91,8 @@ CREATE TABLE activities (
 - 一轮 = 一次 `handle_user_message`，会话 `activity-YYYYMMDD-HHMM`；owner 绑定同夜测模式——`owner_bindings` 临时 INSERT `source='activity'` 行，`finally` 里整批清理，绝不复用 `bind()`（那会替换真实主人绑定）。
 - 提示词 = `activity.decision_prompt`（规则，config 可整段覆盖）+ 素材菜单（runtime 模板化拼装，经 `wrap_untrusted` 作为证据进轮，与「看看空间动态」旁路同一信任面；好友内容默认不给 LLM，只给条数）。菜单含：新帖（作者/时间/摘要）、B 站新入库视频、距上次主动分享、待审批草稿数、life 状态、当前时刻。**决策轮不合成语音**（`allow_voice=False`），回复只进记忆/台账，不打扰真人。
 - 她的动作就是现有动作：`share_with_owner` / `share_to_friend` / `post_qzone` / `remember`，全部闸门（渴望值阈值、每日配额、安静时段顺延、敏感内容拦截）自动生效。`share_with_owner` 的 wakeup 在轮后**改挂到主人的真实 QQ 会话**（`UPDATE wakeups SET session_id`，仅 pending 行）——活动会话是临时的，不改挂的话 proactive_message 会在投递层被 `not_qq_session` 静默丢弃；ProactiveGate/每日唤醒上限在触发时照常拦。
+- **2026-11-18：活动轮可自发发图/表情包**。`make_photo` / `send_sticker` 在活动沙盒里被视为 proactive：`proactive_media=True`、过 `[proactive_media]` 闸门，提交前用 `_media_target_session()` 把 job 重定向到 owner 的 `qq:private:*`，否则 QQ poller 会跳过 `activity-*`。普通聊天和 self-continue 同样走这套闸门。
+- **活动轮上下文（缓存安全）**：活动轮仍用临时 `activity-*` 会话，只在 `extra_evidence` 里注入一段只读的「主人最近 6 轮」摘要。`extra_evidence` 落在 `turn_tail`（`cacheable=False`），不碰 stable prefix / history；活动会话每轮本来就是新 session（history 为空），所以 stable prefix 的缓存命中不受影响。若改成 owner session + transient 模式，则 history 也可缓存，但需要额外屏蔽 owner 副作用，收益不值。
 - 回复以「休息」开头 = 这轮休息（`activity.idle_marker` 可调），台账记 `rest`。
 - 白天硬顶 `activity.max_llm_turns_per_day`（默认 48）；计数走 `decision_log`（kind=`activity_turn`，action=`decide`），跳过不计。
 - **省电捷径**：新帖=0 且 B 站新入库=0 且距上次主动分享 <`activity.share_recency_hours`（默认 6h）→ 整轮跳过不调 LLM。规格书原文的「B 站距上次浏览<间隔」被新入库计数吸收：采集层自管节奏，刚入库的视频必然让计数>0，不会漏聊。

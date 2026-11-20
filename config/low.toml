@@ -13,7 +13,9 @@ api_key_env = "FATFISH_OPENCODE_KEY"
 api_style = "chat_completions"
 # user_agent 从包版本单点生成（fatfish/__init__.py），不再在 profile 里写死。
 send_session_header = true
-max_output_tokens = 800
+# boss 2026-11-15：常规回复上限 800 → 4000（钱不是问题；要的是动作密集回合
+# -- talk_to / post_qzone / sing lyrics -- 的 JSON 不再被截断）。
+max_output_tokens = 4000
 temperature = 0.8
 reasoning_effort = "low"
 timeout_seconds = 90
@@ -40,6 +42,16 @@ max_items_per_search = 5000
 # 召回候选上限。cosine 在 Python 里逐行算，5000 条 768 维约 600ms；
 # 先用 FTS/关键词 + 高重要性补到 512 条再精排，实测约 60ms。0 = 关闭。
 candidate_limit = 512
+# 2026-11-18：遗忘曲线只做排序，不做删除。recency = 2^(-days/half_life)，
+# half_life 由类型/重要性/access_count 决定；归档记忆仍参与召回，但乘一个
+# 惩罚系数。sim>=floor 或关键词精确命中的记忆会获得 recency 下限，保证
+# 「旧但真命中」不被「新但只沾边」挤掉。
+recency_weight = 0.15
+archived_score_multiplier = 0.8
+exact_match_similarity_floor = 0.75
+exact_match_recency_floor = 0.6
+archive_min_access_count = 3
+archive_recent_access_days = 60
 recall_threshold = 0.35
 rag_threshold = 0.28
 recall_kev_threshold = 0.50
@@ -50,7 +62,8 @@ event_min_gap_for_topic_minutes = 10
 event_topic_shift_threshold = 0.15
 today_timeline_chars = 1200
 nightly_voice = true
-nightly_voice_max_tokens = 500
+# boss 2026-11-15：夜间日报也一起放开（500 → 4000）。
+nightly_voice_max_tokens = 4000
 archive_backfill_days = 3
 event_max_per_day = 20
 
@@ -60,7 +73,8 @@ provider = "edge"              # edge | piper | local
 min_score = 0.62
 text_with_voice_min = 0.45
 max_per_hour = 4
-max_per_day = 16
+# boss 2026-11-15：不设每日数额限制（0 = 不限）；每小时上限仍是防刷屏。
+max_per_day = 0
 
 [chat]
 max_messages_per_turn = 4
@@ -74,9 +88,10 @@ message_delay_ms = 450
 # self_continue_prompt 先例留在 runtime 代码里，不在 profile 重复。
 continue_policy_enabled = true
 coax_intervals_minutes = [1.0, 10.0, 30.0]
-coax_desire_low = 0.5
-coax_desire_high = 0.8
-coax_max_rungs_per_day = 6
+# boss 2026-11-15：渴望阈值下调（0.5/0.8 → 0.35/0.6），日上限归零（0 = 不限）。
+coax_desire_low = 0.35
+coax_desire_high = 0.6
+coax_max_rungs_per_day = 0
 coax_rung_llm_retry_minutes = 5
 busy_minutes = 120
 
@@ -112,17 +127,21 @@ quiet_hours = ["01:00", "08:00"]
 # 多少次动作的抬升量」，hard_cap_per_hour = 0 表示只软限、不硬拦。
 [self_action]
 enabled = true                 # 自主动作默认开；软限（阈值/静默/日上限）照旧生效，想关改 false
-initial_threshold = 0.35
-threshold_step = 0.10
-threshold_floor = 0.20
+# boss 2026-11-15：渴望阈值下调（0.35→0.15 / 地板 0.20→0.05 / 步长 0.10→0.06），
+# 日上限归零（0 = 不限）。静默时段与硬顶语义不变。
+# boss 2026-11-17：再降一档（0.15→0.10 / 地板 0.05→0.04 / 步长 0.06→0.05，
+# 恢复速度 30→40 次/小时、探测 30→20 分钟）——照片多用，但仍略少于表情包。
+initial_threshold = 0.10
+threshold_step = 0.05
+threshold_floor = 0.04
 threshold_ceiling = 0.90
 # 本域单位是「次动作」，不是「条消息」：
-# 派生 threshold_decay_per_minute = 0.10 * 30 / 60 = 0.05/分钟
-decay_events_per_hour = 30
+# 派生 threshold_decay_per_minute = 0.05 * 40 / 60 ≈ 0.033/分钟
+decay_events_per_hour = 40
 hard_cap_per_hour = 0          # 0 = 只软限，不硬拦
-daily_cap = 12                 # 每天自主动作次数兜底
+daily_cap = 0                  # boss 2026-11-15：不设每日数额限制（0 = 不限）
 max_events_per_turn = 2        # 每轮自主动作上限（轮内总动作仍受 4 个约束）
-probe_interval_minutes = 30
+probe_interval_minutes = 20
 quiet_hours = ["01:00", "08:00"]
 
 # ---- 主动找主人（占位，本轮代码不接；T-0052）----
@@ -159,7 +178,7 @@ base_url = "http://127.0.0.1:9880/tts"
 format = "wav"
 text_lang = "zh"
 prompt_lang = "zh"
-ref_audio_path = ""            # 本机参考音频路径（wav），例：D:/voices/ref.wav
+ref_audio_path = ""            # e.g. <VOICE_REF>/ref.wav
 prompt_text = ""
 text_split_method = "cut5"
 media_type = "wav"
@@ -193,76 +212,43 @@ timeout_seconds = 180
 idle_unload_seconds = 0
 # 启动后在后台 POST /load，不阻塞 Web；这样第一条聊天不必等 ~65s 冷启动。
 # 只有 IndexTTS 分支支持；CosyVoice 分支沿用它的 --lazy-load。
-warmup = true
+warmup = false               # 桌面启动时不预加载 TTS；第一次 /tts 才加载（省内存/显存）
 # api_key_env = "LOCAL_TTS_KEY"
 # [tts.headers]
 # X-Local-TTS = "1"
 
 [sticker]
-enabled = true
-library_dir = "stickers"
-comfyui_enabled = false
-comfyui_url = "http://127.0.0.1:8188"
-# 0.60 → 0.50。以前不敢降，是因为那时只有这一道闸门，0.50 时普通对话有 5% 会乱发图；
-# 现在情绪闸门（min_emotion_intensity = 2.0）把事务句单独挡在门外，降它不再带进闲聊。
-# 实测（staging_spontaneous.py --sweep-emotion，各 20 句，bge 真向量）：
-#   阈值  情绪闸门关        情绪闸门=2.0
-#   0.45  16/20 + 5/20     16/20 + 0/20
-#   0.50  12/20 + 4/20     12/20 + 0/20   ← 取这行
-#   0.55  12/20 + 2/20     12/20 + 0/20
-#   0.60   8/20 + 0/20      8/20 + 0/20   ← 原值
-# 即自发率 40% → 60%，事务组仍 0/20。0.45 能到 80%，但闸门关着时事务组已漏到
-# 25%，全靠情绪闸门兜底，余量太薄 —— 等情绪语料扩了再考虑。
-intent_threshold = 0.50
-explicit_threshold = 0.20
-intent_backend = "hybrid"       # rules | llm | hybrid | kev
-intent_max_tokens = 400
-intent_cooldown_seconds = 120.0
-base_generation_enabled = true
-# 「库里没有就现画一张」只在她被明确要求发图时用（force）。
-# 开到自发路径上会让 intent_threshold 彻底失效：现画的图固定记 1.00 分，
-# 于是「该发/不该发」两组都变成 100%（副本库实测见 staging_spontaneous.py）。
-base_generation_spontaneous = false
-base_generation_max_chars = 12
-base_generation_max_per_10m = 3
-max_candidates = 20
-# 第二道闸门，和 intent_threshold 正交：那个管「图对不对」，这个管「这一刻值不值得配图」。
-# 0 = 关闭，行为与加这个开关之前完全一致。
-# 刻度是 0~5（fatfish/sticker/emotion.py 纯规则算，1 平淡 / 3 寻常 / 5 爆炸）。
-# 40 句基线实测（staging_spontaneous.py --sweep-emotion）：
-#   阈值 2.0 → 情绪组 19/20 通过，事务组最高只到 1.60，0 通过。
-# 两道闸门能分开调正是它的价值：想放召回就降 intent_threshold，事务闲聊
-# 不会跟着涌进来，因为那些句子里压根没有情绪。
-min_emotion_intensity = 2.0
-
-# 贴纸检索用的向量后端。
-# hash  = 内置哈希，零依赖，但只认字面重合（「委屈」查不到「难过」）。
-# http  = 问本地向量服务（scripts/embedding_server.py，bge-base-zh-v1.5，CPU 跑，不占显存）。
-# 同一批 103 张、同一索引文本实测（见 staging_eval_http.py / staging_calib_sweep.py）：
-#              top-1  top-3  平均排名   普通对话误发图
-#   hash        5/22   8/22    13.1        0/20
-#   bge 未标定   6/22   9/22    23.9        0/20
-#   bge + 锚点   9/22  13/22     5.3        0/20
-# 换后端有两个必须一起做的事，否则会退回「关键词匹配」而不是报错：
-#   1. 库里向量要按新后端重算（重建全部贴纸向量）。256 维和 768 维混放不会
-#      报错，只会因为宽度守卫拿到 0 分。
-#   2. similarity_floor/ceil 是按 bge 的余弦分布标定的，换模型要重标；而且分数量纲
-#      变了，intent_threshold 也得跟着重定。
-embedding_backend = "http"
-embedding_url = "http://127.0.0.1:9881/embed"
-embedding_timeout_seconds = 10.0
-# bge 余弦挤在 0.34~0.60，0.45 的权重等于没用；拉伸到 0..1 才有区分度。
-similarity_floor = 0.42
-similarity_ceil = 0.60
+# 表情包不再「从库里筛」：每次 send_sticker 都走魔搭 LoRA 现生成。
+# 流程：decide() 提交异步任务 -> Runtime.tick 轮询 -> 出图后走 qq_send_image 补发。
+# 2026-11-17 实测（turbo + whalegirl-sticker-v1）：6–174s/张，算力池小、排队波动大。
+library_dir = "stickers"        # 旧库目录，仅打包/兼容用；运行时不读
+generation_enabled = true
+generation_model = "Qwen/Qwen-Image-2.1-Turbo"
+generation_loras = ["sunny1155665/whalegirl-sticker-v1"]
+generation_trigger = "whalegirl_sticker"
+# 贴纸要干净纯色底；8 步 turbo 下最容易跑出纹理背景和噪点，负向词里压住。
+generation_negative = "写实，真人，多人，复杂背景，纹理背景，紫色背景，斑点，污渍，做旧，噪点，乱码，错误文字，错误肢体，双尾巴，多余手指，水印"
+generation_steps = 8
+generation_guidance = 1.0
+generation_size = "1024x1024"
+# 成本闸门：10 分钟最多 8 张，同一时刻允许 2 个任务在排队/运行（boss 2026-11-17 放宽）。
+# 生成失败静默（少一张图，不打断对话）。
+generation_max_per_10m = 8
+generation_max_pending = 2
+modelscope_base_url = "https://api-inference.modelscope.cn/v1"
+modelscope_api_key_env = "MODELSCOPE_API_KEY"
+modelscope_timeout_seconds = 600
+modelscope_poll_seconds = 3.0
 
 [photo]
 enabled = true
-# local = 本机 ComfyUI 出图；remote = 家里那台 GPU 机出图（T-0068，云端用）。
-# 云端见 cloud.toml；本机永远是 local，改了不会让图片跑到别处。
-mode = "local"
+# local = 本机 ComfyUI 出图；remote = 家里那台 GPU 机出图（T-0068，云端用）；
+# modelscope = 魔搭 API-Inference 云端出图（不占本机显存，可直接用自训 LoRA）。
+# boss 2026-11-15：「只用云端」——默认走 modelScope 云端 LoRA，本机 ComfyUI 路径保留
+# （改回 local 即可恢复），不再默认吃本机显卡。
+mode = "modelscope"
 comfyui_url = "http://127.0.0.1:8188"
-comfyui_autostart = false
-# 本机路径请放 config.local.toml（不入库），写法见 config/example.toml。
+comfyui_autostart = true
 comfyui_python = ""
 comfyui_main = ""
 comfyui_cwd = ""
@@ -287,6 +273,26 @@ restart_tts_after = true
 tts_idle_unload_seconds = 300
 min_free_vram_mb = 5800
 
+# 魔搭云端出图（mode = "modelscope"）。model 直接填 LoRA 的 ModelScope
+# model id，平台会自动加载它声明的底模（openmoss/MOSS-Image-SFT）再套 LoRA。
+# 2026-11-12 实测：sunny1155665/whalegirl-moss-v2 出图约 31s，1.2 MB PNG。
+modelscope_base_url = "https://api-inference.modelscope.cn/v1"
+modelscope_model = "sunny1155665/whalegirl-moss-v2"
+# 加速 LoRA（2026-11-17 实测）：底模原生 50 步 / CFG 3.0；DiffSynth 的 OPD
+# 蒸馏 LoRA 把轨迹压到 8 步 / CFG 1.0。角色 LoRA 仍按上面的 model 字段加载，
+# 加速 LoRA 通过 API 的 ``loras`` 参数叠加，不替换角色权重。
+# 8 步**不带**加速 LoRA 会糊（实测），所以这两个值要和 accel_lora 一起改；
+# 关掉加速时把 accel_lora 置空，平台回落到自己的 50 步默认值。
+modelscope_accel_lora = "DiffSynth-Studio/MOSS-Image-SFT-TurboLoRA"
+modelscope_steps = 8
+modelscope_guidance = 1.0
+modelscope_api_key_env = "MODELSCOPE_API_KEY"
+# LoRA 训练时的触发词；拍照提示词会自动带上（去重，不会重复追加）。
+modelscope_trigger = "whalegirl"
+# 单张图的上限：排队 + 5B 模型采样，30s 起步，留足余量。
+modelscope_timeout_seconds = 300
+modelscope_poll_seconds = 3.0
+
 # CosyVoice3-0.5B / Qwen3-TTS local server template (uncomment to use):
 # mode = "http_json"
 # base_url = "http://127.0.0.1:50000/inference_instruct"
@@ -294,22 +300,24 @@ min_free_vram_mb = 5800
 # payload_template = '{"tts_text":"{text}","spk_id":"{voice}","instruct_text":"{emotion}"}'
 
 [sing]
-# 点歌（T-0003）：SoulX-Singer 在 .venv-soulx 里跑，应用本体仍然零依赖。
-# 一次只唱一首，和拍照/TTS 共用 data/run/vram.lock；渲染前自动 POST /unload
-# 让 TTS 让出显卡，渲染结束（成功、失败、超时）在 finally 里 POST /load 还回去。
+# 点歌：全部走 YuE2 full → Demucs → RVC v10g_e30（index 0.60 / protect 0.50 / RMVPE）。
+# renderer 在 .venv-soulx 里跑，应用本体仍然零依赖；一次只唱一首，和拍照/TTS
+# 共用 data/run/vram.lock。渲染前 POST /unload 让 TTS 让出显卡，结束在 finally
+# 里 POST /load 还回去。旧 SoulX 链路已移除，产线只有 YuE2→RVC。
+# renderer 的外部路径走环境变量 YUE2_ROOT / RVC_ROOT / RVC_PTH / RVC_INDEX；不写进仓库。
 enabled = true
 python = ".venv-soulx/Scripts/python.exe"
-script = "soulx/song_v2.py"
-soulx_root = "vendor/SoulX-Singer"
-deps_path = "vendor/singdeps"
-# 不写 lyrics 时唱的定版（v17，数据见 data/soulx/song_final/SETTINGS.json）。
+script = "soulx/song_yue2_rvc.py"
+soulx_root = ""
+deps_path = ""
+# 不写 lyrics 时唱的四句默认歌（renderer 读 phrases[].text）。
 default_src = "data/soulx/persona_song/report.json"
-prompt_wav = "data/whale_voice_demo_v2/refs/cand_home_up1.wav"
-prompt_meta = "data/soulx/prompt_v6.json"
+prompt_wav = ""
+prompt_meta = ""
 output_dir = "songs"          # 相对 data_dir
 emotion = "soft"              # soft 撒娇 / genki 元气 / sad 委屈
-semitones = 3
-timeout_seconds = 300         # 一条约 1-3 分钟；超时杀进程并还显卡
+semitones = 0                 # 保留 YuE2 旋律；要升降调再改，正=升、负=降
+timeout_seconds = 720         # YuE2 约 5-6 分钟；留足余量，超时杀进程并还显卡
 min_free_vram_mb = 5600   # preflight --for svs 的门槛；TTS 先卸到 6.6GB 左右
 unload_tts = true
 reload_tts = true
@@ -331,7 +339,8 @@ max_delay_days = 7
 # boss 2026-11-01：「唤起事件间隔缩短到 30 分钟，多给她一点自由，烧得起 token」。
 # 间隔 90→30 后，每日上限同步 12→24（16h 醒着 ≈ 32 个 30 分钟窗口，24 留余量）；
 # 静默时段顺延与 ProactiveGate 结构性刹车不变，嫌吵先调回这两个数。
-max_per_day = 24
+max_per_day = 0                # boss 2026-11-15：不设每日数额限制（0 = 不限）
+self_continue_max_per_day = 0  # 同上；间隔/静默时段仍是节奏闸
 max_chain_depth = 3
 proactive_min_interval_minutes = 30
 quiet_hours_min_confidence = 0.90
@@ -348,9 +357,8 @@ request_interval_seconds = 1.0
 max_videos_per_day = 8
 # Read-only comment retrieval for each video; 0 = comment reading disabled (no comments requested).
 comments_per_video = 10
-# watch_video 动作（T-0074）预算：每天最多看 3 条；候选/直连时长上限 30 分钟
-# （直连 bvid 不设限，上限只管替她挑选的那条）；字幕总字符预算（client 端截断生效）。
-watch_max_per_day = 3
+# watch_video 动作（T-0074）预算：0 = 不限（boss 2026-11-15）；负数才表示关闭。
+watch_max_per_day = 0
 watch_max_duration_seconds = 1800
 subtitle_max_chars = 20000
 max_comments_per_day = 0
@@ -385,8 +393,9 @@ timeout_seconds = 10.0
 # 「看看我空间动态」旁路一次最多注入的本地动态条数。
 review_max_items = 10
 # ---- 写路径（说说发布；boss 授权 2026-10-25：分享欲模型，ADR-0005）----
-# desire ≥ 阈值（默认 0.7）跳过审批直接发布；低于阈值/缺省进审批箱等主人批。
-auto_post_desire_threshold = 0.7
+# desire ≥ 阈值跳过审批直接发布；低于阈值/缺省进审批箱等主人批。
+# boss 2026-11-15：渴望阈值下调 0.7 → 0.45（分享欲更顺畅）。
+auto_post_desire_threshold = 0.45
 # 一天最多发布条数（含已排队名额）；0 = 不限制（boss 明示不限次），>0 才生效。
 max_posts_per_day = 0
 # 草稿是否必须人工审批（web/CLI）。false 时由 desire 阈值决定是否跳过审批；
@@ -402,8 +411,8 @@ quiet_hours_end = "08:00"
 # 她能主动私聊的对象只有主人（share_with_owner）与 owner_bindings 好友位
 # 绑定的姐姐（share_to_friend），别无他人；收件人由绑定行解析，不可配置绕过。
 [share]
-# 每天主动私聊姐姐的上限；0 = 不限制。计数走 decision_log（kind=friend_share）。
-max_to_friend_per_day = 2
+# 每天主动私聊姐姐的上限；0 = 不限制（boss 2026-11-15：归零）。计数走 decision_log。
+max_to_friend_per_day = 0
 # 安静时段（本地时间 HH:MM）：顺延到时段结束再发。
 quiet_hours_start = "23:30"
 quiet_hours_end = "08:00"
@@ -417,7 +426,7 @@ interval_minutes = 30
 quiet_hours_start = "23:30"
 quiet_hours_end = "08:00"
 # 白天决策轮硬顶：30 分钟 x 16h = 32 轮，48 留余量；0 = 不限制。
-max_llm_turns_per_day = 48
+max_llm_turns_per_day = 0      # boss 2026-11-15：不设每日数额限制（0 = 不限）
 # B站定时入库（采集层）；真正跑起来还需要 [bilibili].enabled=true（cookie 就绪后由 boss 打开）。
 bili_browse_interval_minutes = 120
 bili_browse_limit = 3
@@ -434,6 +443,18 @@ ledger_path = "logs/activity-{date}.jsonl"
 # 决策提示词（规则段）默认内置在 runtime；要整段覆盖时在这里写 decision_prompt = """..."""。
 # 注意：文本不要出现「空间/说说/post_qzone/qzone/好友动态」等词，否则会误触发
 # 「看看空间动态」旁路造成证据重复注入。
+
+# 2026-11-18：自发照片/表情包。活动轮、self-continue、普通聊天三条路都可用；
+# 只有非用户明确要求的动作才过这道闸门，明确「拍照/发表情包」不受限。
+[proactive_media]
+photo_enabled = true
+# boss 2026-11-18：可以多发。0 = 不限；这里保留软上限防失控。
+photo_max_per_day = 10
+photo_min_interval_minutes = 30
+sticker_enabled = true
+sticker_max_per_day = 20
+sticker_min_interval_minutes = 10
+quiet_hours = ["23:30", "08:00"]
 
 [qq]
 enabled = true
@@ -527,12 +548,12 @@ autonomy = "ask"                 # P0 只落地主人指派；P1 再接提案/�
 threshold = 50
 tick_minutes = 10
 proposal_ttl_minutes = 30
-max_proposals_per_day = 6
+max_proposals_per_day = 0        # boss 2026-11-15：每日数额限制归零（0 = 不限）
 idle_return_minutes = 20         # 对方 20 分钟没新消息就归位
 max_trip_minutes = 60
 followup_minutes = 5
-daily_minutes = 30
-max_trips_per_day = 6
+daily_minutes = 0                # 0 = 不限（漫游总时长也不再按天封顶）
+max_trips_per_day = 0            # 0 = 不限
 max_open_threads = 6
 per_thread_cooldown_minutes = 60
 quiet_hours_respect = true

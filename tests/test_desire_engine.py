@@ -44,7 +44,7 @@ T0 = 1_700_000_000.0
 
 
 def settings(**overrides):
-    """[self_action] defaults: step .10, floor .20, ceiling .90, 30/h -> .05/min."""
+    """[self_action] defaults: step .06, floor .05, ceiling .90, 30/h -> .03/min."""
     return replace(SELF_ACTION_DEFAULTS, **overrides)
 
 
@@ -79,12 +79,12 @@ class TestNormalizeDesire(unittest.TestCase):
 
 
 class TestCurrentThreshold(unittest.TestCase):
-    def test_default_self_action_rate_is_five_hundredths_per_minute(self):
+    def test_default_self_action_rate_is_a_thirtieth_per_minute(self):
         cfg = settings()
-        self.assertAlmostEqual(cfg.threshold_decay_per_minute, 0.05, places=12)
+        self.assertAlmostEqual(cfg.threshold_decay_per_minute, 1/30, places=12)
         state = {"threshold": 0.50, "updated_at": T0}
-        self.assertAlmostEqual(current_threshold(cfg, state, T0 + 60), 0.45, places=12)
-        self.assertAlmostEqual(current_threshold(cfg, state, T0 + 120), 0.40, places=12)
+        self.assertAlmostEqual(current_threshold(cfg, state, T0 + 60), 0.50 - 1/30, places=12)
+        self.assertAlmostEqual(current_threshold(cfg, state, T0 + 120), 0.50 - 2/30, places=12)
 
     def test_ten_minutes_decays_exactly_by_ten_minutes_worth(self):
         cfg = settings(decay_events_per_hour=1)  # 0.10/60 = 0.001666.. / min
@@ -98,7 +98,7 @@ class TestCurrentThreshold(unittest.TestCase):
         cfg = settings()
         self.assertEqual(
             current_threshold(cfg, {"threshold": 0.25, "updated_at": T0}, T0 + 10_000),
-            0.20,
+            0.04,
         )
 
     def test_never_above_ceiling(self):
@@ -110,7 +110,7 @@ class TestCurrentThreshold(unittest.TestCase):
     def test_stored_below_floor_is_raised_to_floor(self):
         cfg = settings()
         self.assertEqual(
-            current_threshold(cfg, {"threshold": 0.01, "updated_at": None}, T0), 0.20
+            current_threshold(cfg, {"threshold": 0.01, "updated_at": None}, T0), 0.04
         )
 
     def test_no_decay_without_updated_at(self):
@@ -127,18 +127,18 @@ class TestCurrentThreshold(unittest.TestCase):
 
     def test_fresh_state_uses_initial_threshold(self):
         cfg = settings()
-        self.assertAlmostEqual(current_threshold(cfg, None, T0), 0.35, places=12)
-        self.assertAlmostEqual(current_threshold(cfg, {}, T0), 0.35, places=12)
+        self.assertAlmostEqual(current_threshold(cfg, None, T0), 0.10, places=12)
+        self.assertAlmostEqual(current_threshold(cfg, {}, T0), 0.10, places=12)
 
 
 class TestOnSent(unittest.TestCase):
     def test_lifts_after_decaying_first(self):
         cfg = settings()
         state = {"threshold": 0.35, "updated_at": T0}
-        new = on_sent(cfg, state, 0.8, T0 + 60)  # 0.35 - 0.05 = 0.30, +0.10
+        new = on_sent(cfg, state, 0.8, T0 + 60)  # 0.35 - 1/30 + 0.05
 
         self.assertIsInstance(new, DesireState)
-        self.assertAlmostEqual(new.threshold, 0.40, places=12)
+        self.assertAlmostEqual(new.threshold, 0.35 - 1/30 + 0.05, places=12)
         self.assertEqual(new.updated_at, T0 + 60)
         self.assertEqual(new.last_desire, 0.8)
 
@@ -150,7 +150,7 @@ class TestOnSent(unittest.TestCase):
     def test_lift_from_floor_stays_in_range(self):
         cfg = settings()
         new = on_sent(cfg, {"threshold": 0.20, "updated_at": T0}, 1.0, T0)
-        self.assertAlmostEqual(new.threshold, 0.30, places=12)
+        self.assertAlmostEqual(new.threshold, 0.25, places=12)
 
     def test_desire_is_normalized_on_write(self):
         cfg = settings()
@@ -170,7 +170,7 @@ class TestOnSent(unittest.TestCase):
         cfg = settings()
         new = on_sent(cfg, {"threshold": 0.35}, 0.5, "not-a-time")
         self.assertIsNone(new.updated_at)
-        self.assertAlmostEqual(new.threshold, 0.45, places=12)
+        self.assertAlmostEqual(new.threshold, 0.40, places=12)
 
 
 class TestCanProactiveSend(unittest.TestCase):
@@ -210,9 +210,9 @@ class TestCanProactiveSend(unittest.TestCase):
         self.assertEqual(
             can_proactive_send(cfg, state, 0.30, T0, 0), (False, REASON_BELOW_THRESHOLD)
         )
-        # 0.05/min: after four minutes 0.45 -> 0.25, so 0.30 is enough.
+        # 0.03/min: after six minutes 0.45 -> 0.27, so 0.30 is enough.
         self.assertEqual(
-            can_proactive_send(cfg, state, 0.30, T0 + 240, 0), (True, REASON_OK)
+            can_proactive_send(cfg, state, 0.30, T0 + 360, 0), (True, REASON_OK)
         )
 
     def test_daily_volume_never_blocks_when_hard_cap_is_off(self):
@@ -257,7 +257,7 @@ class TestCanProactiveSend(unittest.TestCase):
 
 
 class TestShouldProbe(unittest.TestCase):
-    """[self_action] probe interval is 30 minutes."""
+    """[self_action] probe interval is 20 minutes."""
 
     def test_false_while_threshold_still_above_last_desire(self):
         cfg = settings()
@@ -267,36 +267,36 @@ class TestShouldProbe(unittest.TestCase):
         # 30 minutes of decay (1.5 in total, clamped by floor) clears 0.5.
         self.assertTrue(
             should_probe(
-                cfg, {"threshold": 0.80, "updated_at": T0}, T0 + 1_800, T0 - 3_600, 0.5
+                cfg, {"threshold": 0.80, "updated_at": T0}, T0 + 1_200, T0 - 3_600, 0.5
             )
         )
 
     def test_true_once_decayed_to_last_desire_and_interval_elapsed(self):
         cfg = settings()
         state = {"threshold": 0.35, "updated_at": T0}
-        self.assertTrue(should_probe(cfg, state, T0 + 1_800, T0, 0.25))
+        self.assertTrue(should_probe(cfg, state, T0 + 1_200, T0, 0.25))
 
     def test_false_before_interval_elapsed(self):
         cfg = settings()
         state = {"threshold": 0.35, "updated_at": T0}
-        self.assertFalse(should_probe(cfg, state, T0 + 1_799, T0, 0.25))
+        self.assertFalse(should_probe(cfg, state, T0 + 1_199, T0, 0.25))
 
     def test_first_round_without_last_desire_is_probeable(self):
         cfg = settings()
         state = {"threshold": 0.90, "updated_at": T0}
-        self.assertTrue(should_probe(cfg, state, T0 + 1_800, None, None))
+        self.assertTrue(should_probe(cfg, state, T0 + 1_200, None, None))
 
     def test_state_last_desire_is_used_when_argument_missing(self):
         cfg = settings()
         state = {"threshold": 0.20, "updated_at": None, "last_desire": 0.5}
-        self.assertTrue(should_probe(cfg, state, T0 + 1_800, T0, None))
+        self.assertTrue(should_probe(cfg, state, T0 + 1_200, T0, None))
         tight = {"threshold": 0.80, "updated_at": None, "last_desire": 0.5}
-        self.assertFalse(should_probe(cfg, tight, T0 + 1_800, T0, None))
+        self.assertFalse(should_probe(cfg, tight, T0 + 1_200, T0, None))
 
     def test_clock_rollback_does_not_probe(self):
         cfg = settings()
         state = {"threshold": 0.20, "updated_at": None}
-        self.assertFalse(should_probe(cfg, state, T0, T0 + 1_800, 0.5))
+        self.assertFalse(should_probe(cfg, state, T0, T0 + 1_200, 0.5))
 
     def test_unusable_now_does_not_probe(self):
         cfg = settings()
@@ -311,11 +311,11 @@ class TestDescribe(unittest.TestCase):
             set(info),
             {"threshold", "decay_per_minute", "elapsed_minutes", "steps_to_ceiling"},
         )
-        self.assertAlmostEqual(info["threshold"], 0.30, places=12)
-        self.assertAlmostEqual(info["decay_per_minute"], 0.05, places=12)
+        self.assertAlmostEqual(info["threshold"], 0.35 - 1/30, places=12)
+        self.assertAlmostEqual(info["decay_per_minute"], 1/30, places=12)
         self.assertAlmostEqual(info["elapsed_minutes"], 1.0, places=12)
-        # (0.90 - 0.30) / 0.10 = 6 -> six more events pin the ceiling.
-        self.assertEqual(info["steps_to_ceiling"], 6)
+        # ceil((0.90 - (0.35 - 1/30)) / 0.05) = 12 -> twelve more events pin the ceiling.
+        self.assertEqual(info["steps_to_ceiling"], 12)
 
     def test_steps_to_ceiling_at_ceiling_is_zero(self):
         self.assertEqual(
@@ -323,9 +323,9 @@ class TestDescribe(unittest.TestCase):
         )
 
     def test_steps_to_ceiling_from_floor(self):
-        # (0.90 - 0.20) / 0.10 = 7
+        # floor 0.04: ceil((0.90 - 0.04) / 0.05) = 18
         self.assertEqual(
-            describe(settings(), {"threshold": 0.20}, T0)["steps_to_ceiling"], 7
+            describe(settings(), {"threshold": 0.04}, T0)["steps_to_ceiling"], 18
         )
 
     def test_elapsed_minutes_is_zero_without_updated_at(self):
@@ -337,15 +337,15 @@ class TestDescribe(unittest.TestCase):
 class TestStateTolerance(unittest.TestCase):
     def test_none_and_empty_mapping(self):
         cfg = settings()
-        self.assertEqual(read_state(None, cfg), DesireState(threshold=0.35))
-        self.assertEqual(read_state({}, cfg), DesireState(threshold=0.35))
+        self.assertEqual(read_state(None, cfg), DesireState(threshold=0.10))
+        self.assertEqual(read_state({}, cfg), DesireState(threshold=0.10))
 
     def test_wrong_types_are_treated_as_missing(self):
         state = read_state(
             {"threshold": "junk", "updated_at": "yesterday", "last_desire": True},
             settings(),
         )
-        self.assertEqual(state.threshold, 0.35)
+        self.assertEqual(state.threshold, 0.10)
         self.assertIsNone(state.updated_at)
         self.assertIsNone(state.last_desire)
 

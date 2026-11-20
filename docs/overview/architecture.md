@@ -3,7 +3,7 @@ title: 系统架构
 type: overview
 status: active
 tags: [architecture, runtime, dataflow, ports, modules]
-updated: 2026-11-03
+updated: 2026-11-10
 ---
 
 # 系统架构
@@ -21,11 +21,11 @@ updated: 2026-11-03
               ↓
 编排层   Runtime：安全 → 认主 → 漫游判定 → 召回 → 提示词 → LLM → 旁路/动作/语音/拍照 → 发送
               ↓
-能力层   记忆(含entity_edges)  语音  唱歌(sing→soulx)  表情包  拍照  词库  漫游(roam)  唤醒/续聊  成长/决策  生活
+能力层   记忆(含entity_edges)  语音  唱歌(sing→yue2+rvc)  表情包  拍照  词库  漫游(roam)  唤醒/续聊  成长/决策  生活
               ↓
-基础层   SQLite(38表,v14)  outbox  trace  控制面(9882)  进程锁(vram.lock)  备份/归档
+基础层   SQLite(schema v17)  outbox  trace  控制面(9882)  进程锁(vram.lock)  备份/归档
               ↓
-模型层   TTS(9880)  向量(9881)  ComfyUI(8188)  SoulX(子进程)  KEV(可选)
+模型层   TTS(9880)  向量(9881)  ComfyUI(8188)  YuE2 / RVC(子进程)  KEV(可选)
 ```
 
 ## 3. 一次对话
@@ -52,7 +52,7 @@ LLM 只能通过白名单动作影响本地（`security/policy.py:ACTION_SPECS`�
 
 ## 5. 数据
 
-38 张表（另有 FTS 影子表），schema v14。核心链路：`conversation_turns` → `conversation_events` → `nightly` 生成 `episodes` / `memory_items` / `rag_chunks` → `RecallGate` 召回；人物侧 `entities`/`entity_edges`/`entity_mentions`。详见 [记忆分支](../branches/memory.md)。
+schema **v17**。表数见 `fatfish/schema.sql`；核心链路：`conversation_turns` → `conversation_events` → `nightly` 生成 `episodes` / `memory_items` / `rag_chunks` → `RecallGate` 召回；人物侧 `entities`/`entity_edges`/`entity_mentions`；异步媒体 `photo_jobs` / `sticker_jobs` / `sing_jobs`。详见 [记忆分支](../branches/memory.md)。
 
 ## 6. 目录
 
@@ -63,7 +63,7 @@ LLM 只能通过白名单动作影响本地（`security/policy.py:ACTION_SPECS`�
 | `web/` | 原生前端（聊天 + 人物卡 + 流式） |
 | `tests/` | unittest 全量（离线），实测数见 AGENTS.md 基线 |
 | `config/` | `low/standard/remote/cloud/tts25-live` profile（low 为 base） |
-| `soulx/` | 唱歌链路研发区（运行时 15 件已接线 `fatfish/sing/`） |
+| `soulx/` | 产线唱歌 renderer（`song_yue2_rvc.py`：YuE2→Demucs→RVC；旧 SoulX 已删除） |
 | `docs/` | 本体系（全景导图见 project-map.md） |
 | `data/`、`models/`、`vendor/` | 本地资产，已被 git 忽略 |
 

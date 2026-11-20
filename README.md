@@ -1,6 +1,6 @@
 # 鲸鱼娘·大肥鱼（fatfish）
 
-本地优先的单用户 AI 伴侣 / 虚拟主播：她在 QQ 和本机 Web 里陪你聊天，会发**中文情感语音**（IndexTTS-2.5）、发表情包、**拍照**（ComfyUI）、**唱歌**（SoulX-Singer）、记事、主动找你、读 B 站与 QQ 空间；主人一句话也能让她**代看 QQ 群聊/私聊、找指定的人搭话、看指定的 B 站视频**，她还会在多个会话间**漫游串场**（ADR-0014）。应用本体只用 **Python 标准库 + SQLite**，无前端构建，Windows 优先（Linux 可跑纯聊天/Web）。
+本地优先的单用户 AI 伴侣 / 虚拟主播：她在 QQ 和本机 Web 里陪你聊天，会发**中文情感语音**（IndexTTS-2.5）、发表情包（魔搭 LoRA 现生成）、**拍照**（ComfyUI / ModelScope）、**唱歌**（YuE2→RVC）、记事、主动找你、读 B 站与 QQ 空间；主人一句话也能让她**代看 QQ 群聊/私聊、找指定的人搭话、看指定的 B 站视频**，她还会在多个会话间**漫游串场**（ADR-0014）。应用本体只用 **Python 标准库 + SQLite**，无前端构建，Windows 优先（Linux 可跑纯聊天/Web）。
 
 - 形态：本机 Web UI + CLI + QQ（NapCat / OneBot v11）；可选本地 GPU 引擎
 - 许可：个人非商用源码可见许可（见 [LICENSE](LICENSE)），第三方组件见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
@@ -41,6 +41,9 @@ python -m fatfish doctor                # 体检：Python/依赖/显存/配置
 | 变量 | 必填 | 说明 |
 |---|---|---|
 | `FATFISH_OPENCODE_KEY` | 聊天必填 | LLM API key（OpenCode Go）；旧名 `OPENCODE_API_KEY` 兼容 |
+| `MODELSCOPE_API_KEY` | 拍照/表情包 | 魔搭 API-Inference key；缺省时两项能力友好降级 |
+| `QQBOT_APPID` / `QQBOT_SECRET` | 官方 QQ Bot | 腾讯 QQ 开放平台机器人凭据（可选，与 NapCat 二选一） |
+| `YUE2_ROOT` / `RVC_ROOT` / `RVC_PTH` / `RVC_INDEX` | 唱歌 | YuE2 与 RVC 的外部安装/权重路径（不写进仓库） |
 | `QQ_ACCESS_TOKEN` | 接 QQ 时 | NapCat 正向 WebSocket 鉴权 token |
 | `QZONE_FRIEND_UINS` | 可选 | 逗号分隔的好友 QQ 号列表（feeds 回退通道；走 env 是为了不把真实 QQ 号写进配置） |
 | `BILIBILI_SESSDATA` / `BILIBILI_BILI_JCT` / `BILIBILI_COOKIE` | 可选 | B 站只读登录（也可用 `B站登录.bat` 扫码） |
@@ -59,17 +62,19 @@ python -m fatfish doctor                # 体检：Python/依赖/显存/配置
 - 运行环境：`.venv-indextts`（装引擎仓库 requirements + `scripts/indextts_server.py` 头部注释所列依赖）
 - 装好后 `python scripts/preflight.py --for tts` 自检，再跑 `启动大肥鱼.bat` 或单独起 `scripts/indextts_server.py`。参考音频已由 `install_assets.py` 播种到 `data/whale_voice_demo_v2/refs/`。
 
-### SoulX-Singer（唱歌，~5.3 GB，显存 ~5.5 GB）
+### YuE2 + RVC（唱歌，外部安装）
 
-- 来源：`git clone https://github.com/Soul-AILab/SoulX-Singer vendor/SoulX-Singer`（Apache-2.0）；权重 `hf download Soul-AILab/SoulX-Singer --local-dir vendor/SoulX-Singer/pretrained_models`（子目录形状以仓库 README 为准）<!-- TODO(boss): 待核实权重落位 -->
-- 运行环境：`.venv-soulx`（torch + 引擎 requirements + `soundfile`/`librosa`/`pyworld`）
-- 配置：`config/low.toml [sing]` 已指向 `soulx/song_v2.py` 与 `vendor/SoulX-Singer`；要点歌先 `python scripts/preflight.py --for svs --unload-tts`（唱歌与 TTS 共用 8 GB 卡，必须串行）。
+- 产线链路：YuE2 全曲 → Demucs → RVC `v10g_e30`（index 0.60 / protect 0.50 / RMVPE）→ 静音门 → 混音。
+- renderer：`soulx/song_yue2_rvc.py`；运行环境 `.venv-soulx`（librosa/numpy/soundfile）。
+- 外部路径通过环境变量提供：`YUE2_ROOT`（含 `.venv`、`models/YuE2-3B`、`models/YuE2-Vae`）、`RVC_ROOT`（含 `.venv-train`、`convert_audio.py`）、`RVC_PTH`、`RVC_INDEX`。
+- 配置：`config/low.toml [sing]`（`semitones=0`、`timeout_seconds=720`）；点歌前先 `python scripts/preflight.py --for svs --unload-tts`（唱歌与 TTS 共用 8 GB 卡，必须串行）。
+- 模型/权重不随仓分发；旧 SoulX 链路已删除，只在 ADR-0002/0010/0015 保留决策记录。
 
 ### bge-base-zh-v1.5（向量，391 MB，CPU 即可）
 
 - 来源：HuggingFace `BAAI/bge-base-zh-v1.5` <!-- TODO(boss): 待补链接 -->
 - 放到：`models/bge-base-zh-v1.5/`
-- 运行环境：`.venv-cosyvoice`（torch + transformers，`scripts/embedding_server.py` 跑在 9881）。表情包检索与记忆向量召回用它；没有它自动退到内置 hash 向量（功能可用，语义相似度变弱）。
+- 运行环境：`.venv-cosyvoice`（torch + transformers，`scripts/embedding_server.py` 跑在 9881）。记忆向量召回可用它；没有它自动退到内置 hash 向量（功能可用，语义相似度变弱）。表情包生成不依赖 bge。
 
 ### NapCat（QQ 通道）
 
@@ -79,26 +84,28 @@ powershell -ExecutionPolicy Bypass -File scripts/setup_napcat.ps1
 
 自动下载 NapCat OneKey（pin 在 v4.18.41）+ 便携 QQ 到 `vendor/napcat`，并种好 `ws://127.0.0.1:3001` 配置；token 从 `.env` 的 `QQ_ACCESS_TOKEN` 读。首次登录在 `http://127.0.0.1:6099` WebUI 扫码。
 
-### ComfyUI + 生图模型（拍照）
+### 拍照后端（ComfyUI / ModelScope）
 
-ComfyUI 建议独立安装（自带 venv，默认端口 8188），把四个路径填进 `config.local.toml [photo]`（见 `config/example.toml`）：`comfyui_python / comfyui_main / comfyui_cwd / models_root`。生图模型：anima-turbo（unet/clip/vae 文件名见配置）；鲸鱼娘人物 LoRA `deepseek_whalegirl_v1.safetensors` 来源 <!-- TODO(boss): 待补链接 -->（AI 模型站 LoRA 多限制再分发，故走链接自备；也可换成任意人物 LoRA，改 `[photo] lora` 即可）。
+默认 `[photo] mode = "modelscope"`：模型 id 填魔搭 LoRA（如 `sunny1155665/whalegirl-moss-v2`），需要 `MODELSCOPE_API_KEY`；不占本机显存。
 
-### 表情包库
+本机 ComfyUI 走 `[photo] mode = "local"`。ComfyUI 建议独立安装（自带 venv，默认端口 8188），把四个路径填进 `config.local.toml [photo]`（见 `config/example.toml`）：`comfyui_python / comfyui_main / comfyui_cwd / models_root`。生图模型：anima-turbo（unet/clip/vae 文件名见配置）；鲸鱼娘人物 LoRA `deepseek_whalegirl_v1.safetensors` 来源 <!-- TODO(boss): 待补链接 -->（AI 模型站 LoRA 多限制再分发，故走链接自备；也可换成任意人物 LoRA，改 `[photo] lora` 即可）。
 
-图片不入主仓：`python scripts/fetch_stickers.py`（来源 <!-- TODO(boss): 待补链接 -->）。不装也能跑——表情包功能自动降级为「无图可用」。
+### 表情包生成（魔搭 LoRA）
+
+表情包不再从本地库检索：`send_sticker` → 魔搭 LoRA 现生成 → `qq_send_image` 异步补发。需要 `MODELSCOPE_API_KEY`；无 key 时返回 `generation_unavailable`，**不回落旧库**。模型/触发词/步数见 `config/low.toml [sticker]`。
 
 ## 无引擎也能跑
 
 - 没有显卡 / 没下模型：纯聊天 + Web + 记忆 + 词库全部可用（LLM 走 API）；TTS/拍照/点歌在缺资产时通过 `missing_assets` 友好降级，不会崩。
 - 完全离线（无 LLM key）：`python -m fatfish demo` 提供无 key 冒烟；聊天走内置本地兜底回复。
-- 全量测试不联网、不需要模型：`python -m unittest discover -s tests -p "test_*.py"`（约 6–7 分钟）。
+- 全量测试不联网、不需要模型：`python -m unittest discover -s tests -p "test_*.py"`（发布树实测 2,515 条 / 0 失败，约 3.6 分钟）。
 
 ## 目录
 
 | 路径 | 说明 |
 |---|---|
 | `fatfish/` | 应用代码（零第三方依赖） |
-| `soulx/` | 唱歌运行时链路（由 SoulX-Singer 子进程执行） |
+| `soulx/` | 产线唱歌 renderer（`song_yue2_rvc.py`，YuE2→RVC） |
 | `scripts/` | 启动/服务/运维脚本（`start_all.py`、`preflight.py`、`install_assets.py`…） |
 | `web/` | 原生前端（无构建） |
 | `tests/` | unittest 全量套件（离线） |
@@ -110,4 +117,4 @@ ComfyUI 建议独立安装（自带 venv，默认端口 8188），把四个路�
 ## 许可证与致谢
 
 本项目源码：[Fatfish Personal Use License](LICENSE)（个人非商用）。
-各上游组件（IndexTTS-2.5 / index-tts、SoulX-Singer、bge-base-zh-v1.5、ComfyUI、NapCat 等）许可证各不相同，逐个登记在 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)——分发方式均为「链接 + 用户自行下载」，请遵守各上游条款。复刻参考音频 `assets/voice/cand_home_up1.wav` 为项目自制录音素材，非开源件，随仓分发仅用于语音克隆参考。
+各上游组件（IndexTTS-2.5 / index-tts、YuE2、RVC、MOSS-Image / Qwen-Image、魔搭 LoRA、bge-base-zh-v1.5、ComfyUI、NapCat 等）许可证各不相同，逐个登记在 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)——分发方式均为「链接 + 用户自行下载」，请遵守各上游条款。复刻参考音频 `assets/voice/cand_home_up1.wav` 为项目自制录音素材，非开源件，随仓分发仅用于语音克隆参考。

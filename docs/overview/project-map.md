@@ -25,18 +25,19 @@ updated: 2026-11-03
 | `deploy/` | Linux 部署（systemd 单元、bootstrap） | ✅ | 原样同步 |
 | `config/` | profile toml（low/standard/remote/cloud/tts25-live） | ✅ | 同步 + 脱敏（真实端点占位化）；`example.toml` 仅发布树有 |
 | `assets/` | 随仓分发资产（复刻参考音频 + 唱歌底稿 json） | ✅ | 仅发布树有（首启由 `install_assets.py` 播种） |
-| `staging/` | 本地研发暂存（含 secrets、实验 db） | ⛔ 永不入库 | 不存在 |
-| `soulx/` | 唱歌链路研发区（46 文件） | ⛔ | 仅 15 个运行时文件改名 `soulx/` 入发布树 |
-| `tasks/`、`skills/`、`scripts/agent_board/` | 多 agent 任务基建 | ✅/本地 | 不入发布树 |
+| `staging/` | 发布同步脱敏映射（`release-sync/scrub.local.toml`，gitignored） | ⛔ 永不入库 | 不存在 |
+| `soulx/` | 产线唱歌 renderer（`song_yue2_rvc.py`） | ✅ | 随产品目录入发布树 |
+| `skills/whale-lyrics/` | 写词规则与离线 lint（不进运行时） | ✅/本地 | 不入发布树 |
+| `scripts/agent_board/` | 多 agent 任务 / 显存闸门运维工具 | ✅/本地 | 不入发布树 |
 | `data/`、`models/`、`vendor/`、`checkpoints/`、`dist/` | 运行时数据 / 模型权重 / 引擎源码 / 打包产物 | ⛔ git 忽略 | 由 fetch 脚本或用户填充 |
-| `.zcode/`、`.workbuddy/`、`.opencode/`、`.agent-board/` | 各 agent 工作区 | ⛔ | 不存在 |
+| `.zcode/`、agent 工作区、`.opencode/`、`.agent-board/` | 各 agent 工作区 | ⛔ | 不存在 |
 | 根目录研发报告 md、`opencode.jsonc`、`served.html`、`headers.txt` | 一次性产物 | ⛔ 或即弃 | 不存在 |
 
 ### 1.2 `data/` 运行时布局与命名
 
 | 路径 | 内容 | 约定 |
 |---|---|---|
-| `data/fatfish.db` (+`-wal`/`-shm`) | 主库（schema v14，38 表 + FTS 影子表） | 永不入库；结构变更走 `fatfish/schema.sql` + `Database.migrate()` |
+| `data/fatfish.db` (+`-wal`/`-shm`) | 主库（schema v17；表数见 `fatfish/schema.sql`） | 永不入库；结构变更走 `fatfish/schema.sql` + `Database.migrate()` |
 | `data/backups/` | 库备份 `fatfish-<用途>-<YYYYMMDD-HHMMSS>.db` | ⛔ 已解跟踪（阶段 3 卫生提交 2026-11-03） |
 | `data/run/` | `vram.lock`（显卡租约）、`control.token`（9882 控制口令牌） | 进程退出自动释放锁 |
 | `data/soulx/` | 唱歌产物音频、`prompt_v6.json` 唱歌底稿 | 音频 wav 不入库 |
@@ -72,17 +73,16 @@ updated: 2026-11-03
 ### 1.5 不可入库清单（隐私红线）
 
 1. 真实聊天内容 / QQ 号 / cookie / pskey / token（`.env` 只存环境变量名）。
-2. 真实库备份（`data/backups/`）、真实工作日志（`.workbuddy/`）。
+2. 真实库备份（`data/backups/`）、真实工作日志（agent 工作区）。
 3. Tailscale 真实 IP 与 tailnet 主机名（占位：`100.x.y.z`、`<你的主机名>.ts.net`）。
-4. 本机路径体系（占位：`D:\fatfish`、`example-tailnet`）。
-5. AI 助手工作区（`.zcode/`、`.workbuddy/`、`.agent-board/`）。
+4. 本机路径体系（占位：`<PROJECT_ROOT>`、`example-tailnet`）。
+5. AI 助手工作区（`.zcode/`、agent 工作区、`.agent-board/`）。
 6. 敏感值提取与门禁：`scripts/build_release_tree.py --gen-scrub`（值只落 `staging/release-sync/scrub.local.toml`）+ `--gate` 全树复查。
 
 ### 1.6 发布树差异速查（独立目录，见同步器 `--dst`）
 
-- **仅发布树有**：`README.md`（对外版）、`AGENTS.md`（AI 部署手册）、`CONTRIBUTING.md`、`LICENSE`、`THIRD_PARTY_NOTICES.md`、`config/example.toml`、`scripts/install_assets.py`、`scripts/fetch_stickers.py`。
-- **改名接线**：`soulx/` 15 个运行时文件 → `soulx/`（`fatfish/sing/service.py` 子进程、6 个测试 sys.path 同步改写）。
-- **改名测试**：`test_staging_indextts_save.py` → `test_indextts_save.py`。
+- **仅发布树有**：`README.md`（对外版）、`AGENTS.md`（AI 部署手册）、`CONTRIBUTING.md`、`LICENSE`、`THIRD_PARTY_NOTICES.md`、`config/example.toml`、`scripts/install_assets.py`。
+- **唱歌接线**：产线 renderer `soulx/song_yue2_rvc.py` 随产品目录入树（旧 SoulX 15 件已删除）。
 - **重同步**：`python scripts/build_release_tree.py --plan` 审查 → `--apply` 写入 → `--gate` 复查；发布树内 `git commit --amend` 保持单初始提交。
 
 ## 二、功能图
@@ -98,7 +98,7 @@ graph LR
     subgraph 核心能力
         CHAT[对话 + 记忆召回]
         VOICE[中文情感语音<br>IndexTTS-2.5]
-        SING[唱歌<br>SoulX-Singer]
+        SING[唱歌<br>YuE2 → RVC]
         PHOTO[拍照生图<br>ComfyUI]
         STICKER[表情包]
         PROACT[主动唤醒/续聊]
@@ -259,7 +259,7 @@ graph TD
 
 ### 4.5 唱歌链路
 
-`sing/service.py:SingService.sing` → 资产检查（`missing_assets` 友好降级）→ `_ensure_vram/_wait_for_vram`（抢 `vram.lock`，先卸 TTS）→ 子进程 `soulx/song_v2.py`（15 个运行时件：melody_v2/prosody/legato/humanize/accomp/reverb/transpose_post…）→ `_render_remote`（云端收到请求时经 tailscale 转发回家里 GPU）→ `_finish` 交还资源 → `finalize_song.py` 收句。
+`sing/service.py:SingService.sing` → 资产检查（`missing_assets` 友好降级）→ `_ensure_vram/_wait_for_vram`（抢 `vram.lock`，先卸 TTS）→ 子进程 `soulx/song_yue2_rvc.py`（YuE2 全曲 → Demucs → RVC `v10g_e30` → 静音门 → 混音）→ `_render_remote`（云端收到请求时经 tailscale 转发回家里 GPU）→ `_finish` 交还资源。
 
 ### 4.6 平台适配
 
@@ -275,7 +275,7 @@ graph TD
 
 `/api/chat`（流式 `/api/chat/stream`）· `/api/tick` · `/api/nightly` · `/api/people`（人物卡面板）· `/api/lexicon/mine` · `/api/memory/update` · `/api/qzone/*`。共享状态接口串行处理；登录走一次性 token。
 
-### 4.9 数据模型（schema v14，38 表 + FTS 影子）
+### 4.9 数据模型（schema v17；表数见 schema.sql）
 
 核心链路：`conversation_turns` → `conversation_events` → nightly 生成 `episodes` / `memory_items` / `rag_chunks` → `RecallGate` 召回；人物侧 `entities` / `entity_edges` / `entity_mentions`；动作侧 `outbox` / `tool_audit` / `decision_log`；另有钱包式状态、sing/photo 任务表等。变更规则见 §1.3。
 

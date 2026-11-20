@@ -1,4 +1,4 @@
-"""T-0041 / T-0045: [ai_chat] base layer -- config contract + schema v11.
+﻿"""T-0041 / T-0045: [ai_chat] base layer -- config contract + schema v11.
 
 The 大肥鱼间聊天 feature is gated entirely by config (one bound QQ account,
 empty = off), and its "50 条/小时" number is a **decay baseline**, not a send
@@ -242,7 +242,7 @@ class SchemaV11Tests(unittest.TestCase):
         self.db.initialize()
 
     def test_version_and_table_and_index(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, "14")
+        self.assertEqual(SCHEMA_VERSION, "17")
         self.assertEqual(self.db.get_meta("schema_version"), SCHEMA_VERSION)
         tables = {
             row["name"]

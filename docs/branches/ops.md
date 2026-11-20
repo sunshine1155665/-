@@ -25,7 +25,7 @@ updated: 2026-10-30
 - 配置：`config/cloud.toml`（`low.toml` 之上的最小覆盖层，只关 GPU 能力）
 - 部署：`deploy/linux/README.md`（`bootstrap.sh` / `napcat.sh` / 两个 systemd unit）
 - 决策与验收判据：`docs/adr/0012-online-tier.md`（status: proposed，结论待回填）
-- 降级：家里没开机时纯文字；`sing` / `photo` 不可用；贴纸只剩关键词+意图（自发基本不出图）
+- 降级：家里没开机时纯文字；`sing` / `photo` 不可用；表情包无 `MODELSCOPE_API_KEY` 时不发图（不回落旧库）
 - SQLite 只能有一个写者：云为主库时，家里那份只读/备份，不许两边同时写
 
 ## 云端独立性与降级矩阵（T-0069，2026-10-30）
@@ -38,9 +38,9 @@ updated: 2026-10-30
 |---|---|---|
 | `[tts] base_url`（`cloud.local.toml`） | 探针判离线 → `home_offline` → 这句改发文字；**已合成的缓存句子照发** | `fatfish/tts/client.py:160-165`（缓存检查在探针之前） |
 | `[remote] enabled`（`cloud.toml` 默认 `true`） | 每 30s 探一次、单次 3s 上限，失败只影响该窗口 | `fatfish/remote.py::build_probe` / `HealthProbe.check`（TTL 缓存） |
-| `[sing] remote_url` | 2s TCP 探活失败 → `home_offline` → 一句人话，**不会**等满 420s | `fatfish/sing/service.py::_render_remote`（`reachable()` 在 `post()` 之前） |
+| `[sing] remote_url` | 2s TCP 探活失败 → `home_offline` → 一句人话，**不会**等满 900s | `fatfish/sing/service.py::_render_remote`（`reachable()` 在 `post()` 之前） |
 | `[photo] remote_url` | 同上；180s 画图预算根本不会被动用 | `tests/test_photo_remote.py::RealTransportTests`（真 socket，整轮 < 5s） |
-| `[sticker] embedding_backend = "hash"` | 与家里无关（云端本地 256 维 hash） | `config/cloud.toml` |
+| `[sticker] generation_*` + `MODELSCOPE_API_KEY` | 无 key → `generation_unavailable`，这句不发图；**不回落旧库检索** | `fatfish/sticker/service.py::StickerService.available` |
 | `.env` 的 `SING_SERVER_TOKEN` / `PHOTO_SERVER_TOKEN` | 缺失 → 家里回 401，云端一句「token 对不上」，不阻塞 | `scripts/sing_server.py::_authorized` / `scripts/photo_server.py::_authorized` |
 | `[qzone] enabled = false` | 直接关掉 | `config/cloud.toml` |
 | NapCat `127.0.0.1:3001` | **纯本机**，与家里无关；它才是「关机也能聊天」的关键路径 | `deploy/linux/napcat*.service` |
@@ -247,8 +247,8 @@ python -m fatfish tts status
 .venv-indextts\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
 ```
 
-- 当前：686 条，约 301s，全部通过（2 skipped）。
-- 测试必须离线可跑：贴纸测试固定 hash 向量 + 0.38 阈值。
+- 当前：2,680 条，约 289s，全部通过（2 skipped；2026-11-20 清理后实测）。
+- 测试必须离线可跑；测试不依赖旧贴纸向量/旧 SoulX。
 - 不要把 `data/fatfish.db` 指向真实库；测试用临时目录。
 
 ## 备份
@@ -320,8 +320,8 @@ python -m fatfish backup
 | 没声音 | 9880 是否在跑、`tts.log`、显存是否被 ComfyUI 占用 |
 | 拍照失败 | `photo_jobs.error`：`vram_conflict_tts` / `comfyui_start_timeout` |
 | 记忆不增长 | `episodes` / `memory_items` 行数；`schema_meta.last_nightly_date` |
-| 向量全 0 | `sticker.embedding_backend` 与库内向量宽度是否一致（768） |
-| 唱歌失败 | `.venv-soulx` 是否借到 `.venv-cosyvoice` 的 torch；`prompt_v6.json` 是否存在 |
+| 表情包不生成 | `MODELSCOPE_API_KEY` 是否设置；`sticker.generation_enabled`；`sticker_jobs.error` |
+| 唱歌失败 | `.venv-soulx` 是否可用；`YUE2_ROOT` / `RVC_ROOT` / `RVC_PTH` / `RVC_INDEX` 是否存在；`prompt_v6.json` 是否存在 |
 
 ## 云端 NapCat 掉线 2026-10-30（账号被踢，不是升级事故）
 

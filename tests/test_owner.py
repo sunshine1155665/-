@@ -313,19 +313,26 @@ class OwnerContextTests(unittest.TestCase):
         self.assertIn("照样称呼主人", group_bundle.text())
         self.assertNotIn("不要使用主人称呼", group_bundle.text())
         self.assertNotIn("不是私聊主人", owner_bundle.text())
+        # 2026-11-15: group rules live in the stable prefix now (rules.group),
+        # not in the per-turn dynamic hint.
+        self.assertIn("【群聊】", group_bundle.sections[0].text)
 
-        for bundle in (owner_bundle, other_bundle, group_bundle):
+        for bundle in (owner_bundle, other_bundle):
             self.assertNotIn("【当前对话者】", bundle.sections[0].text)
             # Look the section up by name: a new block was inserted between the
             # prefix and the transcript (past timeline), so positions move.
             dynamic = {s.name: s.text for s in bundle.sections}["runtime_context"]
             self.assertIn("【当前对话者】", dynamic)
 
-        # The stable prefix (and therefore prompt caching) is untouched.
+        group_dynamic = {s.name: s.text for s in group_bundle.sections}["runtime_context"]
+        self.assertNotIn("【当前对话者】", group_dynamic)
+
+        # The stable prefix (and therefore prompt caching) is untouched for
+        # sessions on the same variant; the group variant is a different prompt.
         self.assertEqual(
             owner_bundle.stable_prefix_hash, other_bundle.stable_prefix_hash
         )
-        self.assertEqual(
+        self.assertNotEqual(
             owner_bundle.stable_prefix_hash, group_bundle.stable_prefix_hash
         )
         self.assertNotEqual(owner_bundle.dynamic_hash, other_bundle.dynamic_hash)

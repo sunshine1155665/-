@@ -201,11 +201,12 @@ class EngineUnitTests(ContinuePolicyTestBase):
         self.policy = ContinuePolicy(self.db, self.config)
 
     def test_rung_count_scales_with_desire(self) -> None:
+        # shipped thresholds: coax_desire_low=0.35 / coax_desire_high=0.60
         self.assertEqual(self.policy.rung_count(None), 1)
         self.assertEqual(self.policy.rung_count(0.3), 1)
-        self.assertEqual(self.policy.rung_count(0.5), 2)
-        self.assertEqual(self.policy.rung_count(0.79), 2)
-        self.assertEqual(self.policy.rung_count(0.8), 3)
+        self.assertEqual(self.policy.rung_count(0.35), 2)
+        self.assertEqual(self.policy.rung_count(0.59), 2)
+        self.assertEqual(self.policy.rung_count(0.6), 3)
         self.assertEqual(self.policy.rung_count(0.99), 3)
 
     def test_arm_requires_thread_or_desire(self) -> None:
@@ -221,7 +222,8 @@ class EngineUnitTests(ContinuePolicyTestBase):
         )
         self.assertEqual(via_desire.action, "arm")
         self.assertEqual(via_desire.reason, "desire")
-        self.assertEqual(via_desire.rungs, 2)
+        # 0.7 >= coax_desire_high (0.60) -> the full three-rung ladder
+        self.assertEqual(via_desire.rungs, 3)
 
         self.db.execute(
             "INSERT INTO open_loops(id, text, status, session_id, subject, created_at) "
@@ -293,19 +295,46 @@ class EngineUnitTests(ContinuePolicyTestBase):
         )
         self.assertEqual(tomorrow.action, "arm")
 
-    def test_daily_cap_blocks_new_ladders(self) -> None:
+    def test_daily_cap_blocks_new_ladders_when_positive(self) -> None:
+        # Explicit config on purpose: the shipped profiles now ship 0 (unlimited).
+        config, db, _ = self.make_env(extra={"chat.coax_max_rungs_per_day": 6})
+        policy = ContinuePolicy(db, config)
+        self.assertEqual(policy.max_rungs_per_day, 6)
         for _ in range(6):
-            self.policy.count_rung(OWNER_SESSION, now=NOON)
-        decision = self.policy.should_arm(
+            policy.count_rung(OWNER_SESSION, now=NOON)
+        decision = policy.should_arm(
             OWNER_SESSION, now=NOON, desire=0.9, thread_open=True
         )
         self.assertEqual(decision.action, "none")
         self.assertEqual(decision.reason, "daily_cap")
         # the cap is per day
-        fresh = self.policy.should_arm(
+        fresh = policy.should_arm(
             OWNER_SESSION, now=NOON + 86400, desire=0.9, thread_open=True
         )
         self.assertEqual(fresh.action, "arm")
+
+    def test_zero_daily_cap_means_unlimited(self) -> None:
+        config, db, _ = self.make_env(extra={"chat.coax_max_rungs_per_day": 0})
+        policy = ContinuePolicy(db, config)
+        self.assertEqual(policy.max_rungs_per_day, 0)
+        for _ in range(50):
+            policy.count_rung(OWNER_SESSION, now=NOON)
+        # 0 is "no quota", not "quota of zero": a full day of rungs never
+        # turns into daily_cap.
+        for _ in range(10):
+            decision = policy.should_arm(
+                OWNER_SESSION, now=NOON, desire=0.9, thread_open=True
+            )
+            self.assertEqual(decision.action, "arm")
+            self.assertEqual(decision.reason, "desire")
+
+    def test_missing_daily_cap_keeps_the_documented_default(self) -> None:
+        # The <0 key is gone: the historical default (6) must still apply.
+        config, db, _ = self.make_env()
+        self.assertIn("chat", config._data)
+        config._data["chat"].pop("coax_max_rungs_per_day", None)
+        policy = ContinuePolicy(db, config)
+        self.assertEqual(policy.max_rungs_per_day, 6)
 
     def test_next_rung_delay_follows_intervals(self) -> None:
         self.assertEqual(self.policy.next_rung_delay(1), 10 * 60)
@@ -404,7 +433,8 @@ class LadderWiringTests(ContinuePolicyTestBase):
         payload = json.loads(pending[0]["payload_json"])
         self.assertEqual(payload["origin"], "coax")
         self.assertEqual(payload["rung"], 1)
-        self.assertEqual(payload["max_rungs"], 2)
+        # desire 0.7 >= coax_desire_high (0.60) -> three rungs
+        self.assertEqual(payload["max_rungs"], 3)
         self.assertIsNone(payload["loop_id"])
         # +1 minute == the scheduler's 60s floor
         self.assertEqual(pending[0]["fire_at"], NOON + 60)
@@ -525,7 +555,8 @@ class LadderFireTests(ContinuePolicyTestBase):
 
     def test_rung_delivery_uses_coax_prompt_and_own_lane(self) -> None:
         config, db, runtime = self.make_env()
-        row = self._arm(runtime, desire=0.4)  # one rung
+        # desire 0.3 < coax_desire_low (0.35): exactly one rung
+        row = self._arm(runtime, desire=0.3)
         rung_at = row["fire_at"]
 
         results = self._deliver(

@@ -3,7 +3,7 @@ title: 记忆系统
 type: branch
 status: in-progress
 tags: [memory, sqlite, rag, tags, entities, people, nightly, recall]
-updated: 2026-11-01
+updated: 2026-11-18
 ---
 
 # 记忆系统
@@ -59,6 +59,20 @@ updated: 2026-11-01
 2. 同事件上下文（`expand_event_context`，标记 `context=True`）与 1 跳实体边补充（`expand_entity_neighbors`，标记 `via_graph=True`，见下文「实体边与关联补充」）；
 3. `memory_items` 摘要召回（作为索引与背景）；
 4. 用户明确要原话时，`recall(..., include_quotes=True)` 才带 `quote_text` 与原始 turn。
+
+### 遗忘曲线与精确命中（2026-11-18）
+
+排序加入「只影响排序、不删除」的时间衰减：
+
+- `recency = 2^(-days/half_life)`；half_life 复用 `_half_life_days()`（类型 + importance + access_count），不再固定 30 天；
+- 查询显式带时间窗（`parse_time_window` 解析出 `time_start/time_end`）时不再叠加 recency 惩罚，避免时间查询被二次排序；
+- `status='archived'` 不再被 `search()` 硬过滤：归档行仍进候选，非精确命中乘 `memory.archived_score_multiplier=0.8` 惩罚；
+- **精确命中保护**：`sim >= 0.75` 或关键词精确命中时，recency 至少为 `0.6`，不会被「新但只沾边」的记忆挤掉；
+- **压缩保护**：`access_count >= 3` 或最近 60 天访问过的记忆不再归档（`_is_protected`），真正被召回的旧记忆不会因为「老」被丢掉；
+- 配置在 `[memory]`：`recency_weight`、`archived_score_multiplier`、`exact_match_similarity_floor`、`exact_match_recency_floor`、`archive_min_access_count`、`archive_recent_access_days`。
+- 测试：`tests/test_memory_time_weighting.py`。
+
+主动分享的动态索引：`_record_proactive_delivery()` 在投递成功后调用 `memory.add_item(source_type='proactive_share', source_id='outbox:<id>')`，立即算 embedding 入库，不等 nightly；同一 `source_id` 自动去重。
 
 CLI：
 

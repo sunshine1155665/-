@@ -360,6 +360,24 @@ class QQOutboxTests(unittest.TestCase):
         results = self.runtime.process_outbox()
         self.assertEqual(results[0]["status"], "deferred")
 
+    def test_async_media_kinds_are_deferred_without_handler(self):
+        # Regression (2026-11-17): Runtime.tick queues ModelScope photo/sticker
+        # results as ``qq_send_image``.  A web/CLI tick has no QQ handler; it
+        # must defer instead of burning attempts and marking the image dead.
+        for kind in ("qq_send_image", "qq_send_voice", "qq_send_file"):
+            item_id, _ = self.runtime.outbox.enqueue(
+                kind,
+                {"target_type": "private", "target_id": "1001", "path": "x.png"},
+                idempotency_key=f"defer:{kind}",
+            )
+            results = self.runtime.process_outbox()
+            self.assertEqual(results[0]["status"], "deferred", kind)
+            row = self.db.query_one(
+                "SELECT status, attempts FROM outbox WHERE id=?", (item_id,)
+            )
+            self.assertEqual(row["status"], "pending")
+            self.assertEqual(int(row["attempts"]), 0)
+
     def test_qq_proactive_message_is_sent_by_handler(self):
         self.runtime.outbox.enqueue(
             "proactive_message",
@@ -369,6 +387,52 @@ class QQOutboxTests(unittest.TestCase):
         results = self.runtime.process_outbox(handlers=self.adapter.handlers())
         self.assertEqual(results[0]["status"], "done")
         self.assertEqual(self.fake.sent, [("private", "1001", "想你了")])
+
+    def test_delivered_proactive_message_enters_the_transcript(self):
+        # Regression: activity shares were delivered but never written to the
+        # owner session, so the next turn could not answer "你刚才说的那个".
+        self.runtime.outbox.enqueue(
+            "proactive_message",
+            {
+                "text": "我刚刷到一个光刻机视频",
+                "session_id": "qq:private:1001",
+                "reason": "分享：B站新视频",
+            },
+            idempotency_key="proactive:share:transcript",
+        )
+        results = self.runtime.process_outbox(handlers=self.adapter.handlers())
+        self.assertEqual(results[0]["status"], "done")
+        row = self.db.query_one(
+            "SELECT role, content FROM conversation_turns "
+            "WHERE session_id=? ORDER BY id DESC LIMIT 1",
+            ("qq:private:1001",),
+        )
+        self.assertEqual(row["role"], "assistant")
+        self.assertEqual(row["content"], "（主动分享）我刚刷到一个光刻机视频")
+        indexed = self.db.query_one(
+            "SELECT summary, tags_json FROM memory_items "
+            "WHERE source_type='proactive_share' ORDER BY observed_at DESC LIMIT 1"
+        )
+        self.assertIsNotNone(indexed)
+        self.assertEqual(indexed["summary"], "我刚刷到一个光刻机视频")
+
+        # A repeated delivery of the same text must not double the transcript.
+        self.runtime.outbox.enqueue(
+            "proactive_message",
+            {
+                "text": "我刚刷到一个光刻机视频",
+                "session_id": "qq:private:1001",
+                "reason": "分享：B站新视频",
+            },
+            idempotency_key="proactive:share:transcript:2",
+        )
+        self.runtime.process_outbox(handlers=self.adapter.handlers())
+        count = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM conversation_turns "
+            "WHERE session_id=? AND role='assistant' AND content=?",
+            ("qq:private:1001", "（主动分享）我刚刷到一个光刻机视频"),
+        )
+        self.assertEqual(int(count["n"]), 1)
 
     def test_non_qq_proactive_message_is_skipped(self):
         self.runtime.outbox.enqueue(
@@ -461,6 +525,32 @@ class QQMediaTests(unittest.TestCase):
         self.assertEqual(len(segments), 1)
         self.assertEqual(segments[0]["type"], "record")
         self.assertEqual(self._b64(segments[0]), self.voice.read_bytes())
+
+    def test_async_photo_kind_is_sent_as_image(self):
+        # Runtime.tick emits ``qq_send_image`` for finished ModelScope photo and
+        # sticker jobs.  NapCat has no such OneBot action; the adapter must map
+        # it to the regular image segment or the picture is silently lost.
+        item_id, _ = self.runtime.outbox.enqueue(
+            "qq_send_image",
+            {
+                "session_id": "qq:private:1001",
+                "target_type": "private",
+                "target_id": "1001",
+                "path": str(self.image),
+                "kind": "image",
+                "content": "拍好啦",
+            },
+            idempotency_key="qq:async-photo:1",
+        )
+        results = self.runtime.process_outbox(handlers=self.adapter.handlers())
+        self.assertEqual(results[0]["status"], "done")
+        target_type, target_id, segments = self.fake.messages[0]
+        self.assertEqual((target_type, target_id), ("private", "1001"))
+        self.assertEqual([s["type"] for s in segments], ["text", "image"])
+        self.assertEqual(segments[0]["data"]["text"], "拍好啦")
+        self.assertEqual(self._b64(segments[1]), self.image.read_bytes())
+        row = self.db.query_one("SELECT status FROM outbox WHERE id=?", (item_id,))
+        self.assertEqual(row["status"], "done")
 
     def test_group_media_uses_group_message(self):
         self._enqueue(

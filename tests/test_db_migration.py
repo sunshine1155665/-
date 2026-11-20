@@ -77,16 +77,40 @@ class MigrationTests(unittest.TestCase):
             db.columns("qzone_posts"), fresh.columns("qzone_posts")
         )
 
+    def test_photo_jobs_reply_to_backfilled_on_v16(self) -> None:
+        # v17 keeps the inbound msg_id on the async job row.  A database that
+        # was created before the column must gain it on the next migrate().
+        db = self._fresh()
+        db.execute("DROP TABLE photo_jobs")
+        db.execute(
+            "CREATE TABLE photo_jobs ("
+            "id TEXT PRIMARY KEY, session_id TEXT NOT NULL DEFAULT '', "
+            "created_at REAL NOT NULL, finished_at REAL, "
+            "status TEXT NOT NULL DEFAULT 'running', "
+            "provider TEXT NOT NULL DEFAULT 'local', task_id TEXT, "
+            "request_text TEXT NOT NULL DEFAULT '', updated_at REAL, "
+            "positive TEXT NOT NULL, negative TEXT NOT NULL DEFAULT '', "
+            "caption TEXT NOT NULL DEFAULT '', prompt_source TEXT NOT NULL DEFAULT '', "
+            "image_path TEXT, error TEXT, "
+            "comfyui_started INTEGER NOT NULL DEFAULT 0)"
+        )
+        db.set_meta("schema_version", "16")
+        result = db.migrate()
+        self.assertIn("photo_jobs.reply_to", result["applied"])
+        self.assertIn("reply_to", db.columns("photo_jobs"))
+
     def test_statement_extraction_executes(self) -> None:
         # every name migrate() relies on must resolve to runnable SQL
         conn = sqlite3.connect(":memory:")
         self.addCleanup(conn.close)
         for name in (
             "photo_jobs",
+            "sticker_jobs",
             "qzone_feed_items",
             "qzone_posts",
             "ai_chat_messages",
             "idx_photo_jobs_created",
+            "idx_sticker_jobs_created",
             "idx_qzone_feed_seen",
             "idx_qzone_feed_ingested",
             "idx_qzone_posts_status",

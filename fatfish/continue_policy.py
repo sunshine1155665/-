@@ -25,6 +25,9 @@ from .clock import human_date
 
 DEFAULT_COAX_INTERVALS_MINUTES: tuple[float, ...] = (1.0, 10.0, 30.0)
 
+#: Per-session daily ladder budget when ``chat.coax_max_rungs_per_day`` is absent.
+DEFAULT_MAX_RUNGS_PER_DAY = 6
+
 # One rung beyond the ladder's last interval is never scheduled.
 MAX_LADDER_RUNGS = 3
 
@@ -137,6 +140,23 @@ def _parse_intervals(raw: Any) -> tuple[float, ...]:
     return tuple(out) if out else DEFAULT_COAX_INTERVALS_MINUTES
 
 
+def _parse_daily_cap(raw: Any) -> int:
+    """``chat.coax_max_rungs_per_day`` -> rungs/day; ``0`` means unlimited.
+
+    Positive values keep the old meaning exactly (``max(1, int(raw))`` is the
+    identity for >= 1).  A missing/garbage value still falls back to the
+    documented default of 6.  ``0`` used to be swallowed by ``... or 6`` and
+    became 6; since 2026-11-15 it means "no daily cap".
+    """
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_RUNGS_PER_DAY
+    if parsed == 0:
+        return 0
+    return max(1, parsed)
+
+
 class ContinuePolicy:
     """Signals + ladder bookkeeping; the runtime owns scheduling and turns."""
 
@@ -150,7 +170,11 @@ class ContinuePolicy:
         )
         self.desire_low = _to_float(config.get("chat.coax_desire_low", 0.5), 0.5)
         self.desire_high = _to_float(config.get("chat.coax_desire_high", 0.8), 0.8)
-        self.max_rungs_per_day = max(1, int(config.get("chat.coax_max_rungs_per_day", 6) or 6))
+        # Per-session daily ladder budget; 0 = unlimited (2026-11-15), >0 keeps
+        # the historical "stop after N delivered rungs today" rule.
+        self.max_rungs_per_day = _parse_daily_cap(
+            config.get("chat.coax_max_rungs_per_day", DEFAULT_MAX_RUNGS_PER_DAY)
+        )
         self.busy_minutes = max(
             1.0, _to_float(config.get("chat.busy_minutes", 120), 120.0)
         )
@@ -299,7 +323,9 @@ class ContinuePolicy:
         wants_more = desire is not None and desire >= self.desire_low
         if not (has_thread or wants_more):
             return ContinueDecision("none", reason="no_thread_no_desire")
-        if self.rungs_today(session_id, now=now) >= self.max_rungs_per_day:
+        if self.max_rungs_per_day > 0 and (
+            self.rungs_today(session_id, now=now) >= self.max_rungs_per_day
+        ):
             return ContinueDecision("none", reason="daily_cap")
         rungs = self.rung_count(desire)
         return ContinueDecision(

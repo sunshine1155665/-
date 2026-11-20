@@ -283,8 +283,14 @@ class PersonaHintTests(ContextRosterTestCase):
         )
         friend_hint = self.assembler._persona_hint("qq:private:20002", "friend")
         self.assertIn("是主人哥哥亲近的朋友，不是主人", friend_hint)
+        # 2026-11-15: the group rules moved into the stable prefix
+        # (rules.group), so the per-turn hint is empty for groups.
         group_hint = self.assembler._persona_hint(GROUP_SESSION, None)
-        self.assertIn("QQ 群聊，主人在群里", group_hint)
+        self.assertEqual("", group_hint)
+        from fatfish.prompt_variants import capabilities_for
+
+        group_prefix = self.assembler.stable_prefix(capabilities_for("qq_group"))
+        self.assertIn("QQ 群聊：主人在群里", group_prefix)
 
 
 class SenderRenderTests(ContextRosterTestCase):

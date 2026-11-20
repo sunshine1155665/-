@@ -3,18 +3,20 @@ title: 路线图
 type: overview
 status: active
 tags: [roadmap, priorities, singing, memory, activity, packaging]
-updated: 2026-10-26
+updated: 2026-11-10
 ---
 
 # 路线图
 
-> 上级：[系统架构](architecture.md) · 相关分支：[唱歌](../branches/singing.md) · [记忆](../branches/memory.md) · [活动规划](../branches/activity.md) · [运维](../branches/ops.md)
+> 上级：[项目总览](project-status.md) · [架构](architecture.md) · 相关分支：[唱歌](../branches/singing.md) · [记忆](../branches/memory.md) · [活动规划](../branches/activity.md) · [运维](../branches/ops.md)
 
 ## 当前焦点
 
-1. **唱歌定版**：已完成——v17（默认 `soft`）定版为 `data/soulx/song_final/`，16.4s，boss 验收通过（默认版本）。
-2. **唱歌进产品**：已完成——`sing` 动作 + `sing_jobs` + QQ `record` + Web `/api/audio`，显存串行（TTS 卸载 → SoulX → 重载），见 ADR-0010。
+1. **产线唱歌**：YuE2 全曲 → Demucs → RVC `v10g_e30`（index 0.60 / protect 0.50 / RMVPE）→ 静音门 → 混音；renderer `soulx/song_yue2_rvc.py`。
+2. **唱歌进产品**：已完成——`sing` 动作 + `sing_jobs` + QQ `record` + Web `/api/audio`，显存串行（TTS 卸载 → YuE2/RVC → 重载），见 ADR-0010。
 3. **记忆可用**：召回准确性专项 2026-10-26 完成（同事件上下文 + 称呼/虚词守卫 + 记忆核查提示 + 真实库基础 8/8 + B 站 7/7 + 生活化 7/7）；下一步真实库实体回填（T-0009，副本干跑已通过）与月/年节点。
+4. **唱歌评测基座**：2026-11-04——确定性渲染 + 双层自动评测 + 自动选 take；见 [ADR-0015](../adr/0015-singing-eval-determinism.md)（历史工具）。
+5. **唱歌通用链**：2026-11-08 定版，2026-11-10 起全部唱歌切到 YuE2→RVC；旧 SoulX 链路已从主仓删除，只在 ADR 保留决策记录。见 [ADR-0016](../adr/0016-yue2-rvc-singing-chain.md) · [ADR-0017](../adr/0017-singing-all-yue2-rvc.md)。
 
 ## 优化顺序（2026-10-24 起）
 
@@ -35,9 +37,10 @@ updated: 2026-10-26
 |---|---|---|---|
 | 1 | 唱歌定版 | `song_final/full.wav` + report，参数写入 singing.md | ✅ v17（16.4s，`soft`）已定版 |
 | 2 | `sing` 动作接入 | QQ 里说“唱首歌”能收到定版音频；其他功能不回归 | ✅ ADR-0010：`sing` + `sing_jobs` + QQ `record` + Web 播放（1433 条整合测试） |
+| 2b | 唱歌通用链 | 6 情境可听；`sing` E2E 成功；参数写入 singing.md | ✅ ADR-0016：YuE2→Demucs→RVC c_e60 index 0.25，E2E 344.7s |
 | 3 | 记忆细节化 | 「几个月前那件事」能答出人物/地点/原话/情绪 | 🟠 规则版召回 + 准确性实测（基础 8/8 + B 站 7/7 + 生活化 7/7）；真实库实体回填（T-0009）副本干跑通过、真实库待人工；月/年节点未开 |
 | 4 | 测试全绿 | 1433 条整合基线全绿（2026-10-26），`docs_index.py --check` 通过 | ✅ |
-| 5 | git 基线 | 首次提交完成，后续每次改动可回滚 | ✅ 已完成 |
+| 5 | git 基线 | 首次提交完成，后续每次改动可回滚 | ✅ `898b2eb` |
 
 ## P1（体验）
 
@@ -48,8 +51,8 @@ updated: 2026-10-26
 | 7b | 两音摆动（7↔9） | 任意 6 连音内 X-Y-X-Y 最多 1 次 | ✅ v7：交替 run 进 DP 状态 + 偏音经过音；四句都不再有等幅三连交替，待试听确认偏音是否过头 |
 | 7c | 角色一致性 | persona ≥ 4（把参考音和歌声一起交给评审做对比） | 🟠 v9 起用参考音对比判定；v9 得 4、v11 得 3（更顺但更像摇篮曲），未达 5 |
 | 7d | 句尾拖音 | 末字 ≥ 2.5 拍且句尾下沉 | ✅ v11：`Spec.final_beats` + `FINAL_BEATS=(2.5,2.5,2.5,3.0)`；好听 3→4、自然 3→4 |
-| 7e | 峰值封顶 | 任一句峰值 ≤ 9（主音上方五度） | ✅ v9 起成立；v8 的八度高潮被评审否决（音色偏儿歌、出戏） |
-| 7f | 四句轮廓去重 | 四句升降指纹两两不同 | ✅ v9/v11；测试 `test_no_two_phrases_share_a_contour`。注意：轮廓不重复≠好听，评审仍判为同一句型 |
+| 7e | 峰值封顶 | 任一句峰值 ≤ 9（主音上方五度） | ✅ v9 起成立；v8 的八度高潮被评审判成「儿歌嗓，出戏」 |
+| 7f | 四句轮廓去重 | 四句升降指纹两两不同 | ✅ v9/v11；测试 `test_no_two_phrases_share_a_contour`。注意：轮廓不重复≠好听，评审仍说「同一句型」 |
 | 8 | TTS 首句延迟 | 首句 < 5s（当前 10–20s） | ⬜ |
 | 9 | 8D 原型接入决策 | 接或明确不接，写入 ADR | ⬜ |
 | 10 | 夜间归档去污染 | 测试 session 不进记忆；同日多 session 有统一日汇总 | ✅ 测试/夜测/演示数据读取隔离 + `day_summary` 跨会话日汇总（幂等）；QQ 群/私聊共享记忆（boss 决定） |
@@ -72,5 +75,6 @@ updated: 2026-10-26
 ## 决策记录
 
 - [ADR-0001 IndexTTS-2.5](../adr/0001-indextts25.md)
-- [ADR-0002 SoulX-Singer 唱歌](../adr/0002-singing-soulx.md)
+- [ADR-0002 SoulX-Singer 唱歌（历史）](../adr/0002-singing-soulx.md)
 - [ADR-0003 记忆层级](../adr/0003-memory-hierarchy.md)
+- [ADR-0016 YuE2→RVC 唱歌通用链](../adr/0016-yue2-rvc-singing-chain.md)

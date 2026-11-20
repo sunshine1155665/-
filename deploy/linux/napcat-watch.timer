@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the NapCat watchdog every 2 minutes
+
+[Timer]
+# 开机后先等 2 分钟（让 docker / napcat 起来），之后每 2 分钟一轮。
+# 用 OnUnitActiveSec 而不是 OnCalendar：跟随 unit 上次激活时间，避免整点抖动。
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Unit=napcat-watch.service
+
+[Install]
+WantedBy=timers.target

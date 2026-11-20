@@ -94,13 +94,13 @@ class ThresholdIndependenceTests(IsolationBase):
         # self_action never acted, so its own state stays at its own initial value.
         self.assertAlmostEqual(
             engine.current_threshold(self.self_action, self.load(SELF_KEY, self.self_action), T0),
-            0.35,
+            0.10,
             places=12,
         )
         # ... and it can still act: the ai_chat ceiling is irrelevant here.
         self.assertEqual(
             engine.can_proactive_send(
-                self.self_action, self.load(SELF_KEY, self.self_action), 0.36, T0, 0
+                self.self_action, self.load(SELF_KEY, self.self_action), 0.16, T0, 0
             ),
             (True, engine.REASON_OK),
         )
@@ -139,13 +139,13 @@ class ThresholdIndependenceTests(IsolationBase):
         sa_threshold = engine.current_threshold(
             self.self_action, self.load(SELF_KEY, self.self_action), T0 + 120
         )
-        # ai_chat 0.1/min -> 0.95 - 0.2 = 0.75; self_action 0.05/min -> 0.90 - 0.1
-        # = 0.80: same maths, different per-domain config, no cross-talk.
+        # ai_chat 0.1/min -> 0.95 - 0.2 = 0.75; self_action 1/30/min -> 0.90 - 0.1
+        # = 0.84: same maths, different per-domain config, no cross-talk.
         self.assertAlmostEqual(ai_threshold, 0.75, places=12)
-        self.assertAlmostEqual(sa_threshold, 0.80, places=12)
+        self.assertAlmostEqual(sa_threshold, 0.9 - 2/30, places=12)
         self.assertAlmostEqual(self.ai.threshold_decay_per_minute, 0.1, places=12)
         self.assertAlmostEqual(
-            self.self_action.threshold_decay_per_minute, 0.05, places=12
+            self.self_action.threshold_decay_per_minute, 1/30, places=12
         )
 
     def test_lifting_ai_chat_never_touches_the_self_action_key(self) -> None:
@@ -193,9 +193,9 @@ class SettingsIndependenceTests(unittest.TestCase):
         sa = read_desire_settings(config, "self_action", defaults=SELF_ACTION_DEFAULTS)
         self.assertAlmostEqual(ai.initial_threshold, 0.80)
         self.assertAlmostEqual(ai.threshold_decay_per_minute, 0.2, places=12)
-        self.assertAlmostEqual(sa.initial_threshold, 0.35)
-        self.assertAlmostEqual(sa.threshold_step, 0.10)
-        self.assertAlmostEqual(sa.threshold_decay_per_minute, 0.05, places=12)
+        self.assertAlmostEqual(sa.initial_threshold, 0.10)
+        self.assertAlmostEqual(sa.threshold_step, 0.05)
+        self.assertAlmostEqual(sa.threshold_decay_per_minute, 1/30, places=12)
 
     def test_disabled_ai_chat_does_not_disable_self_action(self) -> None:
         config = _config(
@@ -239,9 +239,9 @@ class SettingsIndependenceTests(unittest.TestCase):
             ai = read_ai_chat_settings(config)
             sa = read_desire_settings(config, "self_action", defaults=SELF_ACTION_DEFAULTS)
             self.assertAlmostEqual(ai.initial_threshold, 0.30, msg=profile)
-            self.assertAlmostEqual(sa.initial_threshold, 0.35, msg=profile)
+            self.assertAlmostEqual(sa.initial_threshold, 0.10, msg=profile)
             self.assertAlmostEqual(ai.threshold_decay_per_minute, 0.1, msg=profile)
-            self.assertAlmostEqual(sa.threshold_decay_per_minute, 0.05, msg=profile)
+            self.assertAlmostEqual(sa.threshold_decay_per_minute, 1/30, msg=profile)
 
 
 class StateKeyTests(IsolationBase):
@@ -278,8 +278,8 @@ class StateKeyTests(IsolationBase):
 
     def test_a_domain_without_state_reads_its_own_initial_threshold(self) -> None:
         self.save(AI_KEY, engine.DesireState(threshold=0.95, updated_at=T0))
-        self.assertEqual(self.load(SELF_KEY, self.self_action).threshold, 0.35)
-        self.assertEqual(self.load(OWNER_KEY, self.self_action).threshold, 0.35)
+        self.assertEqual(self.load(SELF_KEY, self.self_action).threshold, 0.10)
+        self.assertEqual(self.load(OWNER_KEY, self.self_action).threshold, 0.10)
         # ai_chat's own fallback stays 0.30 -- defaults are per-domain too.
         self.assertEqual(engine.read_state(None, self.ai).threshold, 0.30)
 

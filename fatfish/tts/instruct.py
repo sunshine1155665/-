@@ -28,7 +28,10 @@
 from __future__ import annotations
 
 # 六个类别够用了。再加会让模型的选择变得随意（它只有 400 token 的预算）。
-TONES: tuple[str, ...] = ("neutral", "happy", "soft", "sad", "annoyed", "lively")
+# 委屈系实验档（aggrieved_a/b/c）是 RVC 语料的临时产物，不是产线语气，已移除。
+TONES: tuple[str, ...] = (
+    "neutral", "happy", "soft", "sad", "annoyed", "lively",
+)
 
 # 官方训练措辞（英文两条也是官方的，soft/loud 只有英文版）。
 #

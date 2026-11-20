@@ -376,12 +376,13 @@ class DesireThresholdTests(BaseWriteTest):
 
     def test_desire_at_threshold_auto_publishes(self) -> None:
         service = self._service()
-        result = service.create_post_draft("憋不住了必须发", desire=0.7, now=NOON)
+        # 2026-11-15: auto_post_desire_threshold 0.7 -> 0.45 (boss lowered it).
+        result = service.create_post_draft("憋不住了必须发", desire=0.45, now=NOON)
         self.assertTrue(result["ok"])
         self.assertEqual("queued", result["result"]["status"])
         row = self.db.query_one("SELECT * FROM qzone_posts")
         self.assertEqual("approved", row["status"])
-        self.assertAlmostEqual(0.7, row["desire"])
+        self.assertAlmostEqual(0.45, row["desire"])
         self.assertEqual("desire-threshold", row["decided_by"])
         self.assertIsNotNone(row["decided_at"])
         # Audit trail records the rating and the threshold that let it out.
@@ -391,13 +392,13 @@ class DesireThresholdTests(BaseWriteTest):
         )
         self.assertIsNotNone(log)
         output = json.loads(log["output_json"])
-        self.assertEqual(0.7, output["desire"])
-        self.assertEqual(0.7, output["threshold"])
+        self.assertAlmostEqual(0.45, output["desire"])
+        self.assertAlmostEqual(0.45, output["threshold"])
         self.assertEqual(1, len(self.db.query("SELECT id FROM outbox")))
 
     def test_desire_below_threshold_stays_pending(self) -> None:
         service = self._service()
-        result = service.create_post_draft("有点想说但没那么想", desire=0.69, now=NOON)
+        result = service.create_post_draft("有点想说但没那么想", desire=0.44, now=NOON)
         self.assertTrue(result["ok"])
         self.assertEqual("pending_approval", result["result"]["status"])
         row = self.db.query_one("SELECT * FROM qzone_posts")

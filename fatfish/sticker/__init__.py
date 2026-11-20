@@ -1,19 +1,5 @@
-"""Sticker subsystem."""
+"""Sticker subsystem: ModelScope LoRA generation jobs."""
 
-from .service import (
-    ComfyUIAdapter,
-    DisabledComfyUI,
-    Sticker,
-    StickerCandidate,
-    StickerDecision,
-    StickerService,
-)
+from .service import Sticker, StickerDecision, StickerService
 
-__all__ = [
-    "ComfyUIAdapter",
-    "DisabledComfyUI",
-    "Sticker",
-    "StickerCandidate",
-    "StickerDecision",
-    "StickerService",
-]
+__all__ = ["Sticker", "StickerDecision", "StickerService"]

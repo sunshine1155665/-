@@ -381,19 +381,27 @@ class CoreTests(unittest.TestCase):
         )
 
     def test_sticker_service(self) -> None:
-        stickers = StickerService(self.db, self.config)
-        stickers.add_sticker(
-            "sticker.png",
-            caption="鲸鱼娘摊手，一脸无奈又好笑",
-            tags=["无奈", "好笑"],
-            intents=["tease", "meme"],
-            intensity=2,
+        class _Client:
+            available = True
+
+            def build_payload(self, positive, negative="", *, seed=None, width=1024, height=1024):
+                return {"prompt": positive}
+
+            def submit(self, payload):
+                return "task-1"
+
+        stickers = StickerService(self.db, self.config, client=_Client())
+        decision = stickers.decide("挥手打招呼")
+        self.assertTrue(decision.pending)
+        self.assertEqual(decision.reason, "generation_queued")
+        row = self.db.query_one(
+            "SELECT status FROM sticker_jobs WHERE id=?", (decision.job_id,)
         )
-        decision = stickers.decide("想表达一种无奈又好笑、轻轻的吐槽")
-        self.assertTrue(decision.send)
-        self.assertIsNotNone(decision.sticker)
-        none = stickers.decide("恭喜发财，大吉大利")
-        self.assertFalse(none.send)
+        self.assertEqual(row["status"], "waiting")
+        # No client (key/loras missing) -> silently unavailable, never a crash.
+        offline = StickerService(self.db, self.config)
+        offline.client = None
+        self.assertFalse(offline.decide("再来一张").pending)
 
     def test_context_prefix_hit(self) -> None:
         memory = MemoryService(self.db, self.config)
@@ -573,7 +581,7 @@ class CoreTests(unittest.TestCase):
             "enabled": True,
             "mode": "gpt_sovits",
             "base_url": "http://127.0.0.1:9880/tts",
-            "ref_audio_path": "D:/voice/ref.wav",
+            "ref_audio_path": "<VOICE_REF>/ref.wav",
             "text_lang": "zh",
             "prompt_lang": "zh",
             "media_type": "wav",

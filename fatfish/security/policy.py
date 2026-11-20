@@ -63,7 +63,7 @@ ACTION_SPECS: dict[str, ActionSpec] = {
     "share_to_friend": ActionSpec("share_to_friend", TrustLevel.PRIVATE, 2, allow_group=False, write=True, required_text="text"),
     # Singing on request: private-only, one song per turn, and never a
     # background job -- the render holds the shared VRAM lease for a minute or
-    # two (TTS unloaded -> SoulX -> TTS reloaded), so it must stay a deliberate
+    # two (TTS unloaded -> YuE2/RVC -> TTS reloaded), so it must stay a deliberate
     # act in the current conversation.
     "sing": ActionSpec("sing", TrustLevel.PRIVATE, 1, allow_group=False, write=True),
     # Self-initiated read actions (T-0042 L2): she may look something up in her
@@ -149,7 +149,17 @@ class PolicyEngine:
         *,
         trust: TrustLevel,
         count: int = 0,
+        allowed: frozenset[str] | None = None,
     ) -> PolicyDecision:
+        """Trust / budget validation, plus the platform capability gate.
+
+        ``allowed`` is the set of action names the current prompt variant can
+        actually execute (2026-11-15 platform variants).  ``None`` keeps the
+        historical "every known action is legal" behaviour for callers that do
+        not have a variant.  The capability check runs first: an action the
+        platform never offers should read as unsupported, not as a trust
+        problem.
+        """
         spec = self.specs.get(str(tool or "").strip())
         if spec is None:
             return PolicyDecision(False, "unknown_action")
@@ -161,6 +171,12 @@ class PolicyEngine:
             return PolicyDecision(False, "write_requires_private_trust", spec)
         if count >= spec.max_calls:
             return PolicyDecision(False, "too_many_tool_calls", spec)
+        # Platform variants: an action the entry point never offers reads as
+        # unsupported.  Deliberately after the trust/safety checks so a group
+        # sing still says ``group_not_allowed`` rather than "your prompt did
+        # not list it".
+        if allowed is not None and str(tool or "").strip() not in allowed:
+            return PolicyDecision(False, "unsupported_on_platform", spec)
         payload = args or {}
         if spec.required_text:
             value = str(payload.get(spec.required_text) or "").strip()

@@ -53,6 +53,15 @@ def make_runtime(tmp: Path) -> tuple[object, Database, Runtime]:
         "daily_cap = 100",
         "max_events_per_turn = 10",
         "quiet_hours = []",
+        # 2026-11-18: spontaneous media gate (all three turn sources).
+        "[proactive_media]",
+        "photo_enabled = true",
+        "photo_max_per_day = 6",
+        "photo_min_interval_minutes = 45",
+        "sticker_enabled = true",
+        "sticker_max_per_day = 12",
+        "sticker_min_interval_minutes = 20",
+        "quiet_hours = []",
         # search_videos now refuses before any request when Bilibili is off;
         # this file exercises the search path, so it has to be on here.
         "[bilibili]",
@@ -246,6 +255,110 @@ class RegistrationTests(unittest.TestCase):
         )
         plan = parse_turn_plan(raw)
         self.assertEqual([a.tool for a in plan.actions], list(SCHEMA_KEYS))
+
+
+# --------------------------------------------------- proactive media routing
+class FakePendingPhoto(FakePhoto):
+    """Async ModelScope-shaped result: the job is accepted, not finished."""
+
+    def generate(self, text, *, context=None, session_id=None, now=None):
+        payload = super().generate(
+            text, context=context, session_id=session_id, now=now
+        )
+        payload["pending"] = True
+        return payload
+
+
+class ProactiveMediaRoutingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.config, self.db, self.runtime = make_runtime(self.tmp)
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(self.db.close)
+        self.runtime.owner.bind(SESSION, source="test")
+        self.photo = FakePendingPhoto()
+        self.runtime.photo = self.photo
+
+    def _photo_action(self, *, session_id: str = "activity-20261118-1000"):
+        return self.runtime.execute_actions(
+            [TurnAction("make_photo", {"prompt": "午后的窗边"})],
+            session_id=session_id,
+            reply="",
+            now=NOW,
+            proactive_media=True,
+        )
+
+    def test_activity_photo_is_retargeted_to_owner_and_logged(self) -> None:
+        result = self._photo_action()
+        self.assertTrue(result[0]["ok"], result)
+        self.assertTrue(result[0]["pending"])
+        self.assertEqual(self.photo.calls[0]["session_id"], SESSION)
+        row = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM decision_log "
+            "WHERE kind='proactive_photo' AND action='queued' AND outcome='ok'"
+        )
+        self.assertEqual(int(row["n"]), 1)
+
+    def test_disabled_gate_blocks_before_generation(self) -> None:
+        self.config._data["proactive_media"]["photo_enabled"] = False
+        result = self._photo_action()
+        self.assertFalse(result[0]["ok"])
+        self.assertEqual(result[0]["error"], "proactive_media_gated")
+        self.assertEqual(self.photo.calls, [])
+
+    def test_min_interval_blocks_the_second_photo(self) -> None:
+        first = self._photo_action()
+        self.assertTrue(first[0]["ok"])
+        second = self._photo_action()
+        self.assertFalse(second[0]["ok"])
+        self.assertEqual(second[0]["error"], "proactive_media_gated")
+        self.assertEqual(len(self.photo.calls), 1)
+
+    def test_legacy_sync_sticker_is_queued_as_image(self) -> None:
+        # Cloud may still run the pre-async sticker service (send + file_path).
+        # The runtime must bridge it into qq_send_image instead of assuming
+        # decision.pending exists.
+        class LegacyDecision:
+            send = True
+            reason = "library_match"
+            score = 0.9
+            emotion = 3.0
+            sticker = SimpleNamespace(
+                id="legacy-sticker", file_path="stickers/happy.png", caption="开心"
+            )
+
+        class LegacySticker:
+            def decide(self, *args, **kwargs):
+                return LegacyDecision()
+
+            def record_usage(self, *args, **kwargs):
+                return None
+
+        self.runtime.sticker = LegacySticker()
+        results = self.runtime.execute_actions(
+            [TurnAction("send_sticker", {"need": "开心 转圈"})],
+            session_id="activity-20261118-1000",
+            reply="",
+            now=NOW,
+            proactive_media=True,
+        )
+        self.assertTrue(results[0]["ok"], results)
+        row = self.db.query_one(
+            "SELECT payload_json FROM outbox WHERE kind='qq_send_image' "
+            "ORDER BY id DESC LIMIT 1"
+        )
+        self.assertIsNotNone(row)
+        payload = json.loads(row["payload_json"])
+        self.assertEqual(payload["session_id"], SESSION)
+        self.assertEqual(payload["path"], "stickers/happy.png")
+        self.assertEqual(payload["caption"], "开心")
+
+    def test_owner_context_is_readable_without_touching_prefix(self) -> None:
+        self.runtime.memory.add_turn(SESSION, "user", "刚才聊到光刻机")
+        block = self.runtime._owner_context_for_activity(now=NOW)
+        self.assertIn("光刻机", block)
+        self.assertIn("只读", block)
 
 
 # ----------------------------------------------------------------- make_photo

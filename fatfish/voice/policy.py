@@ -124,10 +124,13 @@ class VoicePolicy:
         )
         max_hour = int(self.config.get("voice.max_per_hour", 4))
         max_day = int(self.config.get("voice.max_per_day", 16))
-        return bool(
-            (not hour or int(hour["n"]) < max_hour)
-            and (not day or int(day["n"]) < max_day)
-        )
+        # 2026-11-15 boss mandate: ``voice.max_per_day = 0`` means unlimited.
+        # Only 0 changes; the hourly cap keeps its historical meaning exactly
+        # (0 there still disables voice altogether -- "count < 0" is never true),
+        # and every positive daily cap still enforces "count < cap".
+        hour_ok = not hour or int(hour["n"]) < max_hour
+        day_ok = max_day == 0 or not day or int(day["n"]) < max_day
+        return bool(hour_ok and day_ok)
 
     def _user_preference(self, session_id: str) -> float:
         # Placeholder until explicit voice feedback is recorded. Keep a neutral

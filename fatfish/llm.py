@@ -109,6 +109,10 @@ class LLMResult:
     latency_ms: float = 0.0
     model: str = ""
     raw_usage: dict[str, Any] = field(default_factory=dict)
+    # ``choices[0].finish_reason`` (or the Responses-style equivalent).
+    # Empty string means "the gateway did not say"; never None, so callers can
+    # compare without null checks.
+    finish_reason: str = ""
 
 
 class LLMClient:
@@ -280,16 +284,64 @@ class LLMClient:
                 return None
         latency = (time.time() - started) * 1000
         text = self._extract_text(data)
+        finish_reason = self._extract_finish_reason(data)
         usage_raw = data.get("usage") or {}
         usage = self._parse_usage(usage_raw)
         self._record_usage(usage, latency)
+        if finish_reason == "length":
+            # ``max_tokens`` is a *total* completion budget: reasoning tokens
+            # count against it, so a truncation no longer means "the reply was
+            # too long" — it can mean the model never got to write anything.
+            # Record it explicitly instead of inferring from a short reply.
+            self._metric(
+                "llm_output_truncated",
+                1.0,
+                {"model": self.model, "provider": self.provider},
+            )
         return LLMResult(
             text=text,
             usage=usage,
             latency_ms=latency,
             model=self.model,
             raw_usage=usage_raw if isinstance(usage_raw, dict) else {},
+            finish_reason=finish_reason,
         )
+
+    def _extract_finish_reason(self, data: dict[str, Any]) -> str:
+        """Best-effort finish reason; ``""`` when the payload cannot say.
+
+        Chat Completions puts it in ``choices[0].finish_reason``.  The
+        Responses API instead reports ``status`` plus ``incomplete_details``:
+        ``max_output_tokens`` is the truncation signal, so it is normalized to
+        the Chat-Completions word ``length`` and everything else is passed
+        through verbatim.  Never raises: a malformed gateway body must not
+        turn a successful completion into a failed turn.
+        """
+        try:
+            choices = data.get("choices")
+            if isinstance(choices, list) and choices:
+                first = choices[0]
+                if isinstance(first, dict):
+                    reason = first.get("finish_reason")
+                    if isinstance(reason, str) and reason.strip():
+                        return reason.strip()
+            details = data.get("incomplete_details")
+            reason = details.get("reason") if isinstance(details, dict) else None
+            if isinstance(reason, str) and reason.strip():
+                reason = reason.strip()
+                if reason in {"max_output_tokens", "max_tokens"}:
+                    return "length"
+                return reason
+            status = data.get("status")
+            if isinstance(status, str):
+                status = status.strip()
+                if status == "incomplete":
+                    return "incomplete"
+                if status == "completed":
+                    return "stop"
+        except Exception:
+            return ""
+        return ""
 
     def _extract_text(self, data: dict[str, Any]) -> str:
         if self.api_style == "responses":

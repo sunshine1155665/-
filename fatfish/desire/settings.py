@@ -100,20 +100,23 @@ class DesireSettings:
 #: ``[ai_chat]`` 的默认值（0.12 * 50 / 60 = 0.1/分钟，与 T-0041 完全一致）。
 AI_CHAT_DEFAULTS = DesireSettings()
 
-#: ``[self_action]`` 的默认值：0.10 * 30 / 60 = 0.05/分钟；单位是「次动作」。
+#: ``[self_action]`` 的默认值：0.06 * 30 / 60 = 0.03/分钟；单位是「次动作」。
 #: ``enabled=True`` 是本域**刻意背离** ``DEFAULT_ENABLED=False`` 的一处：ai_chat
 #: 那条关着是因为没绑 peer 就无从开口，而自主动作只要主人跟她说话就有场景；
-#: 关掉它要显式写 ``enabled=false``。闸门本身（阈值/静默/日上限）一个都没松。
+#: 关掉它要显式写 ``enabled=false``。闸门本身（阈值/静默/每轮上限/硬顶）一个都没松。
+#: 2026-11-15 boss 拍板下调渴望阈值（0.35→0.15 / 地板 0.20→0.05 / 步长
+#: 0.10→0.06），``daily_cap=0`` = 不设每日数额上限（与 ``DEFAULT_DAILY_CAP``
+#: 同义）；静默时段、每轮上限与硬顶语义不变。
 SELF_ACTION_DEFAULTS = DesireSettings(
     enabled=True,
-    initial_threshold=0.35,
-    threshold_step=0.10,
-    threshold_floor=0.20,
+    initial_threshold=0.10,
+    threshold_step=0.05,
+    threshold_floor=0.04,
     threshold_ceiling=0.90,
-    decay_events_per_hour=30,
+    decay_events_per_hour=40,
     hard_cap_per_hour=0,
-    probe_interval_minutes=30,
-    daily_cap=12,
+    probe_interval_minutes=20,
+    daily_cap=0,
     max_events_per_turn=2,
 )
 

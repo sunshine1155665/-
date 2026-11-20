@@ -818,6 +818,10 @@ class QQAdapter:
         # runtime caller/fake keeps its exact signature.
         if images:
             turn_kwargs["images"] = [str(url) for url in images]
+        # Async photo jobs keep the inbound id for passive replies.  Catch-up
+        # turns use a synthetic id, so they must not become reply targets.
+        if not ephemeral_input and event_id:
+            turn_kwargs["reply_to"] = str(event_id)
         result = self.runtime.handle_user_message(
             session_id,
             text,
@@ -1451,6 +1455,12 @@ class QQAdapter:
     def handlers(self) -> dict[str, Callable[[Any], dict[str, Any]]]:
         return {
             "qq_send": self.send_outbox_item,
+            # Async artifacts (photo jobs, cloud TTS) are queued by the runtime
+            # with the same kind names the official QQBot adapter uses.  NapCat
+            # has no OneBot event for those kinds, so normalize them here to the
+            # existing ``qq_send`` + media path instead of dropping the row.
+            "qq_send_image": self.send_outbox_item,
+            "qq_send_voice": self.send_outbox_item,
             "proactive_message": self.send_outbox_item,
             # T-0012 v3: proactive private-chat share to the bound friend
             # slot holder; the payload's friend_uin was resolved (and the
@@ -1482,6 +1492,30 @@ class QQAdapter:
             target_id = str(payload.get("target_id") or "").strip()
             text = str(payload.get("text") or "")
             media = payload.get("media")
+        elif kind in ("qq_send_image", "qq_send_voice"):
+            # Runtime-generated async artifacts (e.g. the ModelScope photo
+            # poller) carry ``path`` + ``content`` instead of a media list.
+            # Map them onto the OneBot segment path so NapCat delivers them.
+            target_type = str(payload.get("target_type") or "").strip().lower()
+            target_id = str(payload.get("target_id") or "").strip()
+            if not target_id:
+                session_id = str(payload.get("session_id") or "")
+                parts = session_id.split(":", 2)
+                if (
+                    len(parts) == 3
+                    and parts[0] == "qq"
+                    and parts[1] in {"private", "group"}
+                    and parts[2]
+                ):
+                    target_type, target_id = parts[1], parts[2]
+            media_kind = "image" if kind == "qq_send_image" else "voice"
+            path = str(payload.get("path") or "").strip()
+            media = (
+                [{"type": media_kind, "path": path, "name": _basename(path)}]
+                if path
+                else []
+            )
+            text = str(payload.get("content") or payload.get("caption") or "")
         elif kind in ("proactive_message", "roam_message", "roam_notice"):
             session_id = str(payload.get("session_id") or "")
             if not session_id.startswith("qq:"):

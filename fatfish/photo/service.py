@@ -41,6 +41,12 @@ from urllib.parse import urlsplit
 from ..config import Config
 from ..db import Database
 from ..process_lock import acquire, lock_path
+from .modelscope import (
+    DEFAULT_BASE_URL as MODELSCOPE_DEFAULT_BASE_URL,
+    DEFAULT_MODEL as MODELSCOPE_DEFAULT_MODEL,
+    ModelScopePhotoClient,
+    ModelScopePhotoError,
+)
 
 # ``PhotoService`` is created once per ``Runtime``, and the web server creates a
 # new Runtime for every chat turn -- so an instance lock alone does not stop two
@@ -69,6 +75,7 @@ STYLE_TAGS = (
     "masterpiece, best quality, highly detailed, cinematic lighting, "
     "film grain, anime style"
 )
+DEFAULT_OUTFIT = "dark navy and white maid dress"
 DEFAULT_NEGATIVE = (
     "worst quality, low quality, score_1, score_2, score_3, blurry, "
     "jpeg artifacts, sepia, multiple girls, extra limbs, bad anatomy, "
@@ -76,8 +83,64 @@ DEFAULT_NEGATIVE = (
     "deformed body, extra arms, extra hands, bad proportions, pasted on"
 )
 DEFAULT_CAPTION = "鲸鱼娘的自拍"
+_COMPOSITION_SCENE_WORDS = (
+    "跑", "跳", "游", "坐", "躺", "站", "走", "转身", "举", "拿", "抱",
+    "海边", "沙滩", "房间", "街", "雨", "雪", "咖啡", "书", "吉他", "花",
+)
+_COMPOSITION_CHARACTER_WORDS = (
+    "自拍", "看镜头", "表情", "衣服", "裙子", "穿", "换", "妆", "发型",
+    "特写", "上半身", "肖像", "装扮",
+)
+_NEW_OUTFIT_WORDS = (
+    "换衣", "换件", "换套", "新衣服", "新裙子", "穿新", "泳装", "旗袍",
+    "制服", "睡衣", "礼服", "婚纱", "和服", "女仆装", "打扮", "装扮",
+)
+
+
+def _choose_composition(request: str) -> str:
+    """M0-M9 order A/B heuristic used by the deterministic fallback."""
+    text = str(request or "")
+    if any(word in text for word in _COMPOSITION_CHARACTER_WORDS):
+        return "character"
+    if any(word in text for word in _COMPOSITION_SCENE_WORDS):
+        return "scene"
+    return "character"
+
+
+def _choose_outfit(request: str) -> str:
+    """Default maid dress unless the request clearly asks for a new outfit."""
+    text = str(request or "")
+    if any(word in text for word in _NEW_OUTFIT_WORDS):
+        return "new"
+    return "default"
+
+
+def _outfit_detail(request: str, outfit: str) -> str:
+    if outfit == "new":
+        cleaned = _clean_request_for_outfit(request)
+        if cleaned:
+            return f"a fresh SFW outfit chosen for the moment: {cleaned}"
+        return "a fresh, scene-appropriate SFW outfit"
+    return DEFAULT_OUTFIT
+
+
+def _clean_request_for_outfit(text: str) -> str:
+    raw = _CONTROL_RE.sub("", str(text or ""))
+    raw = re.sub(r"\s+", " ", raw).strip()
+    return raw[:160]
 PHOTO_REQUEST_RE = re.compile(
-    r"(拍照|拍一张|拍张照|拍个照|拍照片|自拍|来张照片|来一张照片|来张自拍)"
+    r"(拍照|拍一张|拍张照|拍个照|拍照片|自拍|来张照片|来一张照片|来张自拍"
+    # 2026-11-17: 「发几张图」「多发点照片」也是明确要图，旧正则只认
+    # 「拍/自拍/来张照片」，于是她说「来了来了」但一张都没生成。
+    r"|(?:发|来|给|再|多|整|帮)[^。！？!?]{0,8}(?:照片|图|自拍))"
+)
+# 引用/评价已有的图，不是要新图：你发的图、这张照片、刚才那张图。
+_PHOTO_REFERENCE_RE = re.compile(
+    r"(?:你|她|他|刚才|刚刚|上次|之前|上回)"
+    r"[^。！？!?]{0,6}(?:发|拍|给)的[^。！？!?]{0,4}(?:照片|图|自拍)"
+)
+_PHOTO_DEMONSTRATIVE_RE = re.compile(
+    r"(?:这|那)(?:张|些|个)?[^。！？!?]{0,4}(?:照片|图|自拍)"
 )
 _CQ_RE = re.compile(r"\[CQ:[^\]]+\]")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
@@ -121,6 +184,19 @@ _MOOD_EXPRESSIONS = {
     "sad": "soft melancholy expression",
 }
 
+
+def _image_extension(body: bytes) -> str:
+    """Keep the real image format so the web/QQ send path gets a sane suffix."""
+    if body.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if body.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if len(body) >= 12 and body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+        return ".webp"
+    if body.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    return ".png"
+
 _ERROR_MESSAGES = {
     "busy": "正在拍上一张呢，等它拍完再来嘛。",
     "photo_busy": "另一个窗口正在拍照，等这张拍完再来嘛。",
@@ -148,12 +224,36 @@ _ERROR_MESSAGES = {
     "remote_error": "家里画图的服务出了点岔子，等会儿再拍。",
     "unauthorized": "家里拍照服务的 token 对不上，配置里改一下 PHOTO_SERVER_TOKEN 吧。",
     "prompt_missing": "没说要画什么，这次先不拍了。",
+    # -- 魔搭云端出图（[photo] mode = "modelscope"）：不占本机显存。
+    "modelscope_not_configured": (
+        "云端生图还没配好（photo.modelscope_model / MODELSCOPE_API_KEY），这次先不拍了。"
+    ),
+    "modelscope_unauthorized": (
+        "魔搭的 key 不对或没权限，检查一下 MODELSCOPE_API_KEY 吧。"
+    ),
+    "modelscope_rate_limited": "魔搭今天的生图额度用完了，等明天再拍吧。",
+    "modelscope_model_unavailable": (
+        "这个 LoRA 模型云端暂时加载不了，换一个模型或稍后再试。"
+    ),
+    "modelscope_timeout": "云端画太久没回音，这次先算了，等会儿再拍。",
+    "modelscope_failed": "云端画图出了点岔子，等会儿再拍。",
+    "modelscope_no_image": "云端没把图交出来，再试一次？",
+    "modelscope_bad_image": "云端传回来的图是坏的，这次先不拍了。",
 }
 
 
 def wants_photo(text: str | None) -> bool:
     """True when a private-chat message explicitly asks for a photo."""
-    return bool(PHOTO_REQUEST_RE.search(str(text or "")))
+    raw = str(text or "")
+    if _PHOTO_REFERENCE_RE.search(raw):
+        return False
+    # 「这张照片拍得真好」是在评价，不是在要新图；只有同时带请求动词
+    # （再来/多发/给我发…）才算。
+    if _PHOTO_DEMONSTRATIVE_RE.search(raw) and not re.search(
+        r"(?:再|多|发|来|给)", raw
+    ):
+        return False
+    return bool(PHOTO_REQUEST_RE.search(raw))
 
 
 @dataclass(slots=True)
@@ -162,6 +262,12 @@ class PhotoPrompt:
     negative: str
     caption: str = DEFAULT_CAPTION
     source: str = "fallback"
+    # M0-M9 composition choice: "character" = character-first (自拍/立绘),
+    # "scene" = scene-first (动作/交互/环境为主).
+    composition: str = "character"
+    # "default" = 默认海军蓝女仆装；"new" = 按场景/心情换一套 SFW 衣服。
+    outfit: str = "default"
+    outfit_detail: str = ""
 
 
 @dataclass(slots=True)
@@ -178,6 +284,7 @@ class PhotoResult:
     tts_unloaded: bool = False
     tts_stopped: bool = False
     tts_restarted: bool = False
+    pending: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -185,6 +292,8 @@ class PhotoResult:
             "path": self.path,
             "caption": self.caption,
             "error": self.error,
+            "job_id": self.job_id,
+            "pending": self.pending,
         }
 
 
@@ -299,6 +408,7 @@ class PhotoService:
         life: Any = None,
         service_manager: Any = None,
         remote_client: Any = None,
+        modelscope_client: Any = None,
     ):
         self.config = config
         self.db = db
@@ -336,6 +446,73 @@ class PhotoService:
                         DEFAULT_REMOTE_CONNECT_TIMEOUT,
                     )
                 ),
+            )
+        # 魔搭（mode="modelscope"）：图在云端 API-Inference 画，本机不占显存。
+        # ``model`` 直接填 LoRA 的 ModelScope model id，平台会自动加载底模+LoRA。
+        self.modelscope_base_url = str(
+            config.get("photo.modelscope_base_url", MODELSCOPE_DEFAULT_BASE_URL)
+            or MODELSCOPE_DEFAULT_BASE_URL
+        ).strip().rstrip("/")
+        self.modelscope_model = str(
+            config.get("photo.modelscope_model", MODELSCOPE_DEFAULT_MODEL)
+            or MODELSCOPE_DEFAULT_MODEL
+        ).strip()
+        self.modelscope_trigger = str(
+            config.get("photo.modelscope_trigger", "whalegirl") or ""
+        ).strip()
+        self.modelscope_timeout = max(
+            30.0, float(config.get("photo.modelscope_timeout_seconds", 300))
+        )
+        self.modelscope_poll_seconds = max(
+            0.5, float(config.get("photo.modelscope_poll_seconds", 3.0))
+        )
+        self.modelscope_extra = config.get("photo.modelscope_extra", {}) or {}
+        if not isinstance(self.modelscope_extra, dict):
+            self.modelscope_extra = {}
+        # 加速（2026-11-17）：底模 MOSS-Image-SFT 原生 50 步；DiffSynth 的 OPD
+        # 蒸馏 LoRA 把它压到 8 步 / CFG 1.0，角色 LoRA 仍按 model 字段加载。
+        # ``modelscope_extra`` 是兼容旧配置的逃生口：显式写在里面的同名字段优先。
+        self.modelscope_accel_lora = str(
+            config.get("photo.modelscope_accel_lora", "") or ""
+        ).strip()
+        self.modelscope_steps = max(
+            0, int(config.get("photo.modelscope_steps", 0) or 0)
+        )
+        self.modelscope_guidance = max(
+            0.0, float(config.get("photo.modelscope_guidance", 0.0) or 0.0)
+        )
+        self.modelscope_request_params = dict(self.modelscope_extra)
+        if self.modelscope_accel_lora:
+            self.modelscope_request_params.setdefault(
+                "loras", self.modelscope_accel_lora
+            )
+            # 8 步只在加速 LoRA 在场时成立；单独把 accel_lora 置空而留下
+            # steps=8 会退回「无加速的 8 步」——实测就是糊图，所以这两个
+            # 采样参数跟着 accel_lora 一起生效/一起失效。
+            if self.modelscope_steps:
+                self.modelscope_request_params.setdefault(
+                    "steps", self.modelscope_steps
+                )
+            if self.modelscope_guidance:
+                self.modelscope_request_params.setdefault(
+                    "guidance", self.modelscope_guidance
+                )
+        self.modelscope_client = modelscope_client
+        if self.modelscope_client is None and self.mode == "modelscope":
+            key_env = str(
+                config.get("photo.modelscope_api_key_env", "MODELSCOPE_API_KEY") or ""
+            ).strip()
+            self.modelscope_client = ModelScopePhotoClient(
+                self.modelscope_base_url,
+                api_key=os.environ.get(key_env, "") if key_env else "",
+                model=self.modelscope_model,
+                timeout=self.modelscope_timeout,
+                poll_seconds=self.modelscope_poll_seconds,
+                size=(
+                    f"{max(64, int(config.get('photo.width', 1024)))}x"
+                    f"{max(64, int(config.get('photo.height', 1024)))}"
+                ),
+                extra_params=self.modelscope_request_params,
             )
         self.base_url = str(
             config.get("photo.comfyui_url", "http://127.0.0.1:8188")
@@ -376,6 +553,20 @@ class PhotoService:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir = config.data_dir / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        # Composition skill is loaded lazily per PhotoService instance, never
+        # in the main chat context.  Missing file is fine: the built-in
+        # M0-M9 summary in the system prompt remains the fallback.
+        self._skill_text = ""
+        try:
+            raw_skill = str(config.get("photo.skill_path", "") or "").strip()
+            if raw_skill:
+                skill_path = Path(raw_skill)
+                if not skill_path.is_absolute():
+                    skill_path = Path(__file__).resolve().parents[2] / skill_path
+                if skill_path.is_file():
+                    self._skill_text = skill_path.read_text(encoding="utf-8")[:2600]
+        except (OSError, UnicodeError, ValueError):
+            self._skill_text = ""
 
         # Discovery is lazy: ``Runtime`` is built for every chat turn, and
         # probing a control plane that is not running used to cost the full
@@ -434,13 +625,33 @@ class PhotoService:
 
     # ------------------------------------------------------------- public API
     def status(self) -> dict[str, Any]:
-        assets = self.asset_report()
+        assets = self.asset_report() if self.mode == "local" else {}
         return {
             "enabled": self.enabled,
             "mode": self.mode,
             "remote_url": self.remote_url if self.mode == "remote" else "",
-            "comfyui_url": self.base_url,
-            "comfyui_running": self._comfyui_up(),
+            "modelscope_model": self.modelscope_model
+            if self.mode == "modelscope"
+            else "",
+            "modelscope_base_url": self.modelscope_base_url
+            if self.mode == "modelscope"
+            else "",
+            "modelscope_accel_lora": self.modelscope_accel_lora
+            if self.mode == "modelscope"
+            else "",
+            "modelscope_steps": self.modelscope_steps
+            if self.mode == "modelscope"
+            else 0,
+            "modelscope_guidance": self.modelscope_guidance
+            if self.mode == "modelscope"
+            else 0.0,
+            "modelscope_available": bool(
+                self.mode == "modelscope"
+                and self.modelscope_client is not None
+                and getattr(self.modelscope_client, "available", False)
+            ),
+            "comfyui_url": self.base_url if self.mode == "local" else "",
+            "comfyui_running": self._comfyui_up() if self.mode == "local" else False,
             "autostart": self.autostart,
             "stop_after": self.stop_after,
             "unet": self.unet,
@@ -498,6 +709,8 @@ class PhotoService:
         self,
         user_text: str,
         context: dict[str, Any] | None = None,
+        *,
+        session_id: str = "",
     ) -> PhotoPrompt:
         """One low-effort LLM call; deterministic fallback on any failure.
 
@@ -507,29 +720,74 @@ class PhotoService:
         request = self._clean_request(user_text)
         life = self._life_state(context)
         fallback = self._fallback_prompt(request, life)
+        if self.mode == "modelscope":
+            fallback = self._with_modelscope_trigger(fallback)
         if self.llm is None or not getattr(self.llm, "available", False):
             return fallback
+        if self.mode == "modelscope":
+            trigger = self.modelscope_trigger or "whalegirl"
+            system_content = (
+                "You write one safe-for-work anime image prompt for MOSS-Image. "
+                "The character is fixed: an adult whale girl with blue gradient "
+                "hair, very long wavy hair, blue eyes, an ahoge, whale ear fins "
+                "and a single whale tail. "
+                f"Start the positive prompt with the trigger word {trigger!r}. "
+                "Use the M0-M9 composition rules: choose composition='character' "
+                "for selfies/portraits/outfit/expression focus (M0->M3->M4->M1), "
+                "or composition='scene' when an action, interaction, place or "
+                "object is the main subject (M0->M1->M2->M3->M4->M5). "
+                f"The default outfit is {DEFAULT_OUTFIT!r}; use outfit='default' "
+                "unless the user asks for different clothes or the scene/mood "
+                "clearly calls for one.  For outfit='new', invent one fresh, "
+                "SFW, in-character outfit and describe it in outfit_detail. "
+                "User wishes about clothes always win. "
+                "Return strict JSON only, no markdown: "
+                '{"composition":"character|scene","outfit":"default|new",'
+                '"outfit_detail":"English outfit description or empty",'
+                '"positive":"English prompt",'
+                '"negative":"short English negative prompt",'
+                '"caption":"short Chinese caption <= 20 chars"}. '
+                "Never mention the user's identity, location, real names or "
+                "private data."
+            )
+            if self._skill_text:
+                system_content += (
+                    "\n\nApply this on-demand composition skill, but follow its "
+                    "shape rather than inventing extra sections:\n"
+                    + self._skill_text
+                )
+        else:
+            system_content = (
+                "You write English Danbooru/Anima tags for one safe-for-work "
+                "anime selfie. The character is fixed: an adult whale girl "
+                "with blue hair, very long wavy hair, blue eyes, an ahoge and "
+                "a whale tail. Include the character tags in every positive "
+                "prompt. Choose composition='character' for selfies/portraits/"
+                "outfit focus, or composition='scene' when an action, place or "
+                f"object matters. The default outfit is {DEFAULT_OUTFIT!r}; "
+                "use outfit='default' unless clothes are requested or clearly "
+                "implied. For outfit='new', invent a fresh SFW outfit and put "
+                "it in outfit_detail. User wishes about clothes always win. "
+                "Return strict JSON only, no markdown: "
+                '{"composition":"character|scene","outfit":"default|new",'
+                '"outfit_detail":"outfit description or empty",'
+                '"positive":"comma separated English tags",'
+                '"negative":"comma separated English tags",'
+                '"caption":"short Chinese caption <= 20 chars"}. '
+                "Never mention the user's identity, location, real names or "
+                "private data."
+            )
         messages = [
             {
                 "role": "system",
-                "content": (
-                    "You write English Danbooru/Anima tags for one safe-for-work "
-                    "anime selfie. The character is fixed: an adult whale girl "
-                    "with blue hair, very long wavy hair, blue eyes, an ahoge and "
-                    "a whale tail. Include the character tags in every positive "
-                    "prompt. Return strict JSON only, no markdown: "
-                    '{"positive":"comma separated English tags",'
-                    '"negative":"comma separated English tags",'
-                    '"caption":"short Chinese caption <= 20 chars"}. '
-                    "Never mention the user's identity, location, real names or "
-                    "private data."
-                ),
+                "content": system_content,
             },
             {
                 "role": "user",
                 "content": (
                     f"User request: {request or 'a casual selfie'}\n"
                     f"Current life state: {self._format_life(life)}\n"
+                    "Pick the composition order and outfit yourself. "
                     "Scene should fit the request and the life state. "
                     "Camera: selfie or close-up, looking at viewer."
                 ),
@@ -538,8 +796,20 @@ class PhotoService:
         try:
             result = self.llm.chat(
                 messages,
-                max_tokens=360,
+                # The gateway's max_tokens is a *total* completion budget and
+                # reasoning tokens count against it (measured on deepseek-v4.1-
+                # flash: 800/900 could be consumed before a single JSON token
+                # was emitted).  The prompt is short and the answer is one
+                # small JSON object, so a large cap costs nothing when unused
+                # and is the only way to survive a chatty reasoning model.
+                max_tokens=10000,
                 temperature=0.7,
+                # 2026-11-15: the gateway now rejects requests without an
+                # ``x-opencode-session`` header (400 MissingSessionID), which
+                # silently degraded every photo prompt to the fallback.  Use
+                # the turn's session when the caller has one, else a stable
+                # pseudo-session so the same prompt build is routable.
+                session_id=session_id or "photo:prompt",
             )
         except Exception:
             return fallback
@@ -554,12 +824,31 @@ class PhotoService:
             return fallback
         negative = self._clean_prompt_text(data.get("negative") or "")
         caption = self._clean_caption(data.get("caption") or "")
-        return PhotoPrompt(
+        composition = str(data.get("composition") or "").strip().lower()
+        if composition not in {"character", "scene"}:
+            composition = _choose_composition(request)
+        outfit = str(data.get("outfit") or "").strip().lower()
+        if outfit not in {"default", "new"}:
+            outfit = _choose_outfit(request)
+        outfit_detail = self._clean_prompt_text(data.get("outfit_detail") or "")
+        if not outfit_detail:
+            outfit_detail = _outfit_detail(request, outfit)
+        if outfit == "default" and DEFAULT_OUTFIT.lower() not in positive.lower():
+            positive = f"{positive}, {DEFAULT_OUTFIT}"
+        elif outfit == "new" and outfit_detail and outfit_detail.lower() not in positive.lower():
+            positive = f"{positive}, {outfit_detail}"
+        photo = PhotoPrompt(
             positive=self._ensure_character_tags(positive),
             negative=self._merge_negative(negative),
             caption=caption or fallback.caption,
             source="llm",
+            composition=composition,
+            outfit=outfit,
+            outfit_detail=outfit_detail,
         )
+        if self.mode == "modelscope":
+            photo = self._with_modelscope_trigger(photo)
+        return photo
 
     def generate(
         self,
@@ -578,6 +867,16 @@ class PhotoService:
             return PhotoResult(False, error="disabled", elapsed_ms=0.0)
         if self.mode == "remote":
             return self._generate_remote(
+                user_text,
+                context=context,
+                prompt=prompt,
+                session_id=session_id,
+                seed=seed,
+                now=now,
+                started=started,
+            )
+        if self.mode == "modelscope":
+            return self._generate_modelscope(
                 user_text,
                 context=context,
                 prompt=prompt,
@@ -606,7 +905,9 @@ class PhotoService:
         vram_lock = None
         self._tts_unloaded_this_job = False
         try:
-            photo = prompt or self.build_prompt(user_text, context)
+            photo = prompt or self.build_prompt(
+                user_text, context, session_id=session_id
+            )
             try:
                 self._insert_job(job_id, session_id, now, photo)
             except sqlite3.Error:
@@ -750,7 +1051,9 @@ class PhotoService:
         job_id = uuid.uuid4().hex[:16]
         photo: PhotoPrompt | None = None
         try:
-            photo = prompt or self.build_prompt(user_text, context)
+            photo = prompt or self.build_prompt(
+                user_text, context, session_id=session_id
+            )
             try:
                 self._insert_job(job_id, session_id, now, photo)
             except sqlite3.Error:
@@ -791,6 +1094,298 @@ class PhotoService:
             )
         finally:
             self._lock.release()
+
+    # -- 魔搭云端出图（[photo] mode = "modelscope"） ------------------------
+    def _generate_modelscope(
+        self,
+        user_text: str,
+        *,
+        context: dict[str, Any] | None,
+        prompt: PhotoPrompt | None,
+        session_id: str,
+        seed: int | None,
+        now: float,
+        started: float,
+    ) -> PhotoResult:
+        """One ModelScope API-Inference job; no local VRAM, no ComfyUI.
+
+        The LoRA is selected by ``photo.modelscope_model`` (a ModelScope model
+        id such as ``sunny1155665/whalegirl-moss-v2``); the platform loads the
+        declared base model and the LoRA together.  Everything else mirrors the
+        remote path: one lock, one row in ``photo_jobs``, one image on disk.
+        """
+        if not self._lock.acquire(blocking=False):
+            return PhotoResult(False, error="busy", elapsed_ms=0.0)
+        job_id = uuid.uuid4().hex[:16]
+        photo: PhotoPrompt | None = None
+        try:
+            photo = prompt or self.build_prompt(
+                user_text, context, session_id=session_id
+            )
+            photo = self._with_modelscope_trigger(photo)
+            try:
+                self._insert_job(job_id, session_id, now, photo)
+            except sqlite3.Error:
+                return PhotoResult(
+                    False,
+                    error="photo_storage_error",
+                    job_id=job_id,
+                    elapsed_ms=(time.time() - started) * 1000,
+                )
+
+            client = self.modelscope_client
+            if client is None or not getattr(client, "available", False):
+                self._update_job(
+                    job_id, status="failed", error="modelscope_not_configured"
+                )
+                return PhotoResult(
+                    False,
+                    error="modelscope_not_configured",
+                    job_id=job_id,
+                    prompt_source=photo.source,
+                    elapsed_ms=(time.time() - started) * 1000,
+                )
+
+            try:
+                raw = client.generate(
+                    photo.positive,
+                    photo.negative,
+                    seed=seed,
+                    width=self.width,
+                    height=self.height,
+                )
+            except ModelScopePhotoError as exc:
+                self._update_job(
+                    job_id, status="failed", error=exc.error_text
+                )
+                return PhotoResult(
+                    False,
+                    error=exc.error_text,
+                    job_id=job_id,
+                    prompt_source=photo.source,
+                    elapsed_ms=(time.time() - started) * 1000,
+                )
+
+            target = self.output_dir / f"{job_id}{_image_extension(raw)}"
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp = target.with_name(target.name + ".part")
+                tmp.write_bytes(raw)
+                os.replace(tmp, target)
+            except OSError:
+                self._update_job(
+                    job_id, status="failed", error="photo_storage_error"
+                )
+                return PhotoResult(
+                    False,
+                    error="photo_storage_error",
+                    job_id=job_id,
+                    prompt_source=photo.source,
+                    elapsed_ms=(time.time() - started) * 1000,
+                )
+
+            self._update_job(
+                job_id, status="done", image_path=str(target)
+            )
+            return PhotoResult(
+                True,
+                path=str(target),
+                caption=photo.caption,
+                job_id=job_id,
+                prompt_source=photo.source,
+                elapsed_ms=(time.time() - started) * 1000,
+            )
+        except Exception as exc:  # one bad job must not kill the runtime
+            error = f"{type(exc).__name__}:{str(exc)[:160]}"
+            self._update_job(job_id, status="failed", error=error)
+            return PhotoResult(
+                False,
+                error=error,
+                job_id=job_id,
+                prompt_source=photo.source if photo else "",
+                elapsed_ms=(time.time() - started) * 1000,
+            )
+        finally:
+            self._lock.release()
+
+    # ------------------------------------------------ async ModelScope jobs
+    def _pending_modelscope_job(self) -> dict[str, Any] | None:
+        try:
+            return self.db.query_one(
+                "SELECT id FROM photo_jobs WHERE provider='modelscope' "
+                "AND status IN ('waiting','running') ORDER BY created_at LIMIT 1"
+            )
+        except sqlite3.Error:
+            return None
+
+    def start_modelscope_job(
+        self,
+        user_text: str = "",
+        *,
+        context: dict[str, Any] | None = None,
+        session_id: str = "",
+        now: float | None = None,
+        reply_to: str = "",
+    ) -> PhotoResult:
+        """Submit one async ModelScope job and return immediately.
+
+        The LLM prompt build and the HTTP submit are fast (seconds); polling and
+        download happen in :meth:`poll_modelscope_jobs`, driven by
+        ``Runtime.tick``.  This is the multi-round photo path: the turn can
+        answer "等我一下下" while the image is still rendering.
+        """
+        started = time.time()
+        now = time.time() if now is None else now
+        if not self.enabled:
+            return PhotoResult(False, error="disabled", elapsed_ms=0.0)
+        if self.mode != "modelscope":
+            return PhotoResult(False, error="modelscope_not_configured", elapsed_ms=0.0)
+        client = self.modelscope_client
+        if client is None or not getattr(client, "available", False):
+            return PhotoResult(False, error="modelscope_not_configured", elapsed_ms=0.0)
+        if self._pending_modelscope_job() is not None:
+            return PhotoResult(False, error="busy", elapsed_ms=0.0)
+        if not self._lock.acquire(blocking=False):
+            return PhotoResult(False, error="busy", elapsed_ms=0.0)
+        photo: PhotoPrompt | None = None
+        job_id = uuid.uuid4().hex[:16]
+        try:
+            photo = self.build_prompt(user_text, context, session_id=session_id)
+            photo = self._with_modelscope_trigger(photo)
+            payload = client.build_payload(
+                photo.positive,
+                photo.negative,
+                seed=None,
+                width=self.width,
+                height=self.height,
+            )
+            task_id = client.submit(payload)
+            self._insert_job(
+                job_id,
+                session_id,
+                now,
+                photo,
+                provider="modelscope",
+                task_id=task_id,
+                request_text=user_text,
+                status="waiting",
+                reply_to=reply_to,
+            )
+            return PhotoResult(
+                True,
+                caption=photo.caption,
+                job_id=job_id,
+                prompt_source=photo.source,
+                elapsed_ms=(time.time() - started) * 1000,
+                pending=True,
+            )
+        except ModelScopePhotoError as exc:
+            return PhotoResult(
+                False,
+                error=exc.error_text,
+                job_id=job_id,
+                prompt_source=photo.source if photo else "",
+                elapsed_ms=(time.time() - started) * 1000,
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad job must not kill the runtime
+            return PhotoResult(
+                False,
+                error=f"{type(exc).__name__}:{str(exc)[:160]}",
+                job_id=job_id,
+                prompt_source=photo.source if photo else "",
+                elapsed_ms=(time.time() - started) * 1000,
+            )
+        finally:
+            self._lock.release()
+
+    def poll_modelscope_jobs(
+        self,
+        *,
+        now: float | None = None,
+        limit: int = 2,
+    ) -> list[dict[str, Any]]:
+        """Poll due ModelScope jobs once; download successes for delivery."""
+        now = time.time() if now is None else now
+        if self.mode != "modelscope":
+            return []
+        client = self.modelscope_client
+        if client is None or not getattr(client, "available", False):
+            return []
+        try:
+            rows = self.db.query(
+                "SELECT id, session_id, created_at, status, task_id, caption, reply_to "
+                "FROM photo_jobs WHERE provider='modelscope' "
+                "AND status IN ('waiting','running') ORDER BY created_at LIMIT ?",
+                (max(1, int(limit)),),
+            )
+        except sqlite3.Error:
+            return []
+        completed: list[dict[str, Any]] = []
+        for row in rows:
+            job_id = str(row["id"])
+            session_id = str(row["session_id"] or "")
+            task_id = str(row["task_id"] or "").strip()
+            created_at = float(row["created_at"] or now)
+            if not task_id:
+                self._update_job(job_id, status="failed", error="missing_task_id")
+                continue
+            if now - created_at > self.modelscope_timeout + 30.0:
+                self._update_job(job_id, status="failed", error="modelscope_timeout")
+                continue
+            if not self._lock.acquire(blocking=False):
+                continue
+            try:
+                result = client.poll(task_id)
+                if result.get("status") != "succeeded":
+                    self.db.execute(
+                        "UPDATE photo_jobs SET updated_at=? WHERE id=?",
+                        (now, job_id),
+                    )
+                    continue
+                raw = client.download(str(result["url"]))
+                target = self.output_dir / f"{job_id}{_image_extension(raw)}"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp = target.with_name(target.name + ".part")
+                tmp.write_bytes(raw)
+                os.replace(tmp, target)
+                self._update_job(job_id, status="done", image_path=str(target))
+                completed.append(
+                    {
+                        "ok": True,
+                        "job_id": job_id,
+                        "session_id": session_id,
+                        "path": str(target),
+                        "caption": str(row["caption"] or ""),
+                        "reply_to": str(row["reply_to"] or ""),
+                    }
+                )
+            except ModelScopePhotoError as exc:
+                self._update_job(job_id, status="failed", error=exc.error_text)
+                completed.append(
+                    {
+                        "ok": False,
+                        "job_id": job_id,
+                        "session_id": session_id,
+                        "error": exc.error_text,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._update_job(
+                    job_id,
+                    status="failed",
+                    error=f"{type(exc).__name__}:{str(exc)[:160]}",
+                )
+                completed.append(
+                    {
+                        "ok": False,
+                        "job_id": job_id,
+                        "session_id": session_id,
+                        "error": f"{type(exc).__name__}:{str(exc)[:160]}",
+                    }
+                )
+            finally:
+                self._lock.release()
+        return completed
 
     def _remote_job(
         self, photo: PhotoPrompt, job_id: str, seed: int | None
@@ -950,15 +1545,28 @@ class PhotoService:
             )
         mood = str(life.get("mood") or "calm").lower()
         expression = _MOOD_EXPRESSIONS.get(mood, "gentle smile")
-        positive = (
-            f"{STYLE_TAGS}, {CHARACTER_TAGS}, selfie, looking at viewer, "
-            f"upper body, from above, smartphone camera, {expression}, {scene}"
-        )
+        composition = _choose_composition(request)
+        outfit = _choose_outfit(request)
+        outfit_detail = _outfit_detail(request, outfit)
+        if composition == "scene":
+            positive = (
+                f"{STYLE_TAGS}, {scene}, {CHARACTER_TAGS}, {outfit_detail}, "
+                f"selfie, looking at viewer, upper body, smartphone camera, {expression}"
+            )
+        else:
+            positive = (
+                f"{STYLE_TAGS}, {CHARACTER_TAGS}, {outfit_detail}, "
+                f"selfie, looking at viewer, upper body, from above, "
+                f"smartphone camera, {expression}, {scene}"
+            )
         return PhotoPrompt(
             positive=positive,
             negative=DEFAULT_NEGATIVE,
             caption=DEFAULT_CAPTION,
             source="fallback",
+            composition=composition,
+            outfit=outfit,
+            outfit_detail=outfit_detail,
         )
 
     def _ensure_character_tags(self, positive: str) -> str:
@@ -969,6 +1577,21 @@ class PhotoService:
         if "masterpiece" not in positive.lower():
             positive = f"{STYLE_TAGS}, {positive}"
         return positive
+
+    def _with_modelscope_trigger(self, photo: PhotoPrompt) -> PhotoPrompt:
+        """Prepend the LoRA trigger word (``whalegirl``) exactly once."""
+        trigger = self.modelscope_trigger
+        if not trigger or trigger.lower() in photo.positive.lower():
+            return photo
+        return PhotoPrompt(
+            positive=f"{trigger}, {photo.positive}",
+            negative=photo.negative,
+            caption=photo.caption,
+            source=photo.source,
+            composition=photo.composition,
+            outfit=photo.outfit,
+            outfit_detail=photo.outfit_detail,
+        )
 
     @staticmethod
     def _merge_negative(negative: str) -> str:
@@ -1040,19 +1663,31 @@ class PhotoService:
         session_id: str,
         now: float,
         photo: PhotoPrompt,
+        *,
+        provider: str = "local",
+        task_id: str | None = None,
+        request_text: str = "",
+        status: str = "running",
+        reply_to: str = "",
     ) -> None:
         self.db.execute(
             "INSERT INTO photo_jobs(id, session_id, created_at, status, "
-            "positive, negative, caption, prompt_source) VALUES (?,?,?,?,?,?,?,?)",
+            "provider, task_id, request_text, updated_at, positive, negative, "
+            "caption, prompt_source, reply_to) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 job_id,
                 session_id[:120],
                 float(now),
-                "running",
+                status,
+                provider,
+                task_id,
+                request_text[:500],
+                float(now),
                 photo.positive,
                 photo.negative,
                 photo.caption,
                 photo.source,
+                str(reply_to or "")[:200],
             ),
         )
 
@@ -1064,17 +1699,21 @@ class PhotoService:
         image_path: str | None = None,
         error: str | None = None,
         comfyui_started: bool = False,
+        task_id: str | None = None,
     ) -> None:
         try:
             self.db.execute(
                 "UPDATE photo_jobs SET status=?, image_path=?, error=?, "
-                "finished_at=?, comfyui_started=? WHERE id=?",
+                "finished_at=?, comfyui_started=?, updated_at=?, "
+                "task_id=COALESCE(?, task_id) WHERE id=?",
                 (
                     status,
                     image_path,
                     (error or "")[:500],
                     time.time(),
                     1 if comfyui_started else 0,
+                    time.time(),
+                    task_id,
                     job_id,
                 ),
             )

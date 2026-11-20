@@ -13,7 +13,7 @@ from typing import Any, Iterator, Sequence
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 # Bump this whenever schema.sql or migrate() changes so ``ensure_schema`` knows
 # it has real work to do.  It must match the value written by ``migrate``.
-SCHEMA_VERSION = "14"
+SCHEMA_VERSION = "17"
 
 _SCHEMA_SQL_CACHE: str | None = None
 
@@ -149,6 +149,7 @@ class Database:
     # out of schema.sql (see _statement_from_schema) plus their indexes.
     _TABLE_MIGRATIONS: tuple[str, ...] = (
         "photo_jobs",
+        "sticker_jobs",
         "qzone_feed_items",
         "qzone_posts",
         "sing_jobs",
@@ -166,9 +167,21 @@ class Database:
         # only -- the v8-shaped table is never rebuilt.
         ("qzone_posts", "desire", "REAL"),
         ("qzone_posts", "decided_by", "TEXT"),
+        # Schema v15: async photo jobs (ModelScope submit -> tick poll ->
+        # download -> adapter image outbox).  Old synchronous rows keep the
+        # 'local' provider default and never enter the polling query.
+        ("photo_jobs", "provider", "TEXT NOT NULL DEFAULT 'local'"),
+        ("photo_jobs", "task_id", "TEXT"),
+        ("photo_jobs", "request_text", "TEXT NOT NULL DEFAULT ''"),
+        ("photo_jobs", "updated_at", "REAL"),
+        # Schema v17: the inbound message id the async photo answers.  Kept
+        # across ticks so the finished image can be sent as a passive reply
+        # (official QQ bot) instead of an easy-to-reject proactive message.
+        ("photo_jobs", "reply_to", "TEXT NOT NULL DEFAULT ''"),
     )
     _INDEX_MIGRATIONS: tuple[str, ...] = (
         "idx_photo_jobs_created",
+        "idx_sticker_jobs_created",
         "idx_qzone_feed_seen",
         "idx_qzone_feed_ingested",
         "idx_qzone_posts_status",

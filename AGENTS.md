@@ -48,7 +48,7 @@ python -m fatfish demo        # 期望：无 key 冒烟演示通过，退出码 
 # ③ 引擎 venv（按需创建；哪个引擎装哪个）
 python -m venv .venv-indextts    # 语音 IndexTTS-2.5
 python -m venv .venv-cosyvoice   # 向量 bge（+ 可选 CosyVoice 备用引擎）
-python -m venv .venv-soulx       # 唱歌 SoulX-Singer
+python -m venv .venv-soulx       # 唱歌 YuE2 → RVC
 ```
 
 引擎 venv 内安装对应引擎仓库的 `requirements.txt`（先把引擎拉下来，见 §3），再补链路依赖：
@@ -75,15 +75,16 @@ huggingface-cli download IndexTeam/IndexTTS-2.5 --local-dir models/IndexTTS-2.5
 期望：`models/IndexTTS-2.5/` 下出现配置与权重文件（目录大小 ~11 GB）。
 参考音频不在这里：装完资产后自动就位（§5 步骤 1）。
 
-### 3.2 唱歌 SoulX-Singer（~5.3 GB → `vendor/SoulX-Singer/`）
+### 3.2 唱歌 YuE2 + RVC（外部安装）
 
-```bash
-git clone https://github.com/Soul-AILab/SoulX-Singer vendor/SoulX-Singer
-huggingface-cli download Soul-AILab/SoulX-Singer --local-dir vendor/SoulX-Singer/pretrained_models
-```
+产线 renderer 是 `soulx/song_yue2_rvc.py`，运行环境 `.venv-soulx`（librosa/numpy/soundfile）。
 
-（权重落位子目录以 SoulX-Singer 仓库 README 为准；<!-- TODO(boss): 待核实权重落位 -->）
-期望：`vendor/SoulX-Singer/soulxsinger/` 代码目录 + 权重目录存在。
+1. 安装 YuE2 到任意目录，确保 `$YUE2_ROOT/.venv/Scripts/yue2.exe`、`$YUE2_ROOT/models/YuE2-3B`、`$YUE2_ROOT/models/YuE2-Vae` 存在。
+2. 安装 RVC 到任意目录，确保 `$RVC_ROOT/.venv-train/Scripts/python.exe`、`$RVC_ROOT/convert_audio.py` 存在；准备 `RVC_PTH` / `RVC_INDEX`。
+3. 把这四个路径写进 `.env`：`YUE2_ROOT`、`RVC_ROOT`、`RVC_PTH`、`RVC_INDEX`。
+4. 自检：`python scripts/preflight.py --for svs --unload-tts`，再点歌。
+
+旧 SoulX 链路已删除；不要在仓库里找 `vendor/SoulX-Singer` 或 `song_v2.py`。
 
 ### 3.3 向量 bge-base-zh-v1.5（391 MB → `models/bge-base-zh-v1.5/`）
 
@@ -101,7 +102,7 @@ powershell -ExecutionPolicy Bypass -File scripts/setup_napcat.ps1
 
 ### 3.5 生图 ComfyUI + LoRA
 
-ComfyUI 独立安装（建议 https://github.com/comfyanonymous/ComfyUI 自带 venv）。装完把 4 个路径填进 `config.local.toml [photo]`（键与写法照抄 `config/example.toml` 注释）。人物 LoRA `deepseek_whalegirl_v1.safetensors` 与表情包库来源见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)（<!-- TODO(boss): 待补链接 -->）。
+ComfyUI 独立安装（建议 https://github.com/comfyanonymous/ComfyUI 自带 venv）。装完把 4 个路径填进 `config.local.toml [photo]`（键与写法照抄 `config/example.toml` 注释）。人物 LoRA `deepseek_whalegirl_v1.safetensors` 与表情包 LoRA 来源见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。表情包现在走魔搭生成，需要 `MODELSCOPE_API_KEY`。
 
 ## 4. 配置
 
@@ -176,7 +177,7 @@ python -m fatfish demo                        # 无 key 聊天冒烟
 | 模型下不全 / 校验失败 | 网络中断 | 重新执行下载命令（huggingface-cli 幂等续传） |
 | Web 打不开 8765 | start_all 用随机端口 | 日志里找 `Web: http://...` 那行 |
 | `python -m fatfish agent` 不存在 | 子命令叫 `run` | `python -m fatfish run --poll 30`（且不要与 QQ 适配器同时跑，会饿死 outbox） |
-| 表情包检索全是关键词命中 | 向量后端退回 hash | 装 bge（§3.3）并把 `[sticker] embedding_backend` 保持 `http` |
+| 表情包不生成 | 魔搭/生成配置 | 检查 `MODELSCOPE_API_KEY`、`sticker.generation_enabled`、`sticker_jobs.error`；不会回落旧库 |
 | 测试大量失败 | 在错误目录 / 缺 Python 3.11 / 环境变量污染 | 确认 cwd=仓库根、`python --version` 是 3.11；测试必须离线，清掉代理类 env 后重跑 |
 
 ## 8. 改代码前（协作约定）

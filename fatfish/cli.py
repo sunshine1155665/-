@@ -31,6 +31,8 @@ from .bilibili import BilibiliClient, BilibiliCollector, BilibiliError
 from .qzone import QzoneClient, QzoneCollector, QzoneError
 from .platforms.onebot import OneBotClient, websocket_available
 from .platforms.qq import QQAdapter
+from .platforms.qqbot import QQBotAdapter, make_client as make_qqbot_client
+from .platforms.qqbot import websocket_available as qqbot_websocket_available
 from .process_lock import acquire, lock_path
 from .security import KernelError, PolicyEngine, load_kernel
 from .trace import TraceRecorder
@@ -714,45 +716,38 @@ def cmd_voice_decide(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_sticker_add(args: argparse.Namespace) -> int:
+def cmd_sticker_generate(args: argparse.Namespace) -> int:
+    """Submit one ModelScope LoRA sticker job and wait for the PNG."""
     config, db = _bootstrap(args)
     s = _services(config, db)
-    st = s["sticker"].add_sticker(
-        args.file,
-        caption=args.caption,
-        tags=args.tag or [],
-        intents=args.intent or [],
-        intensity=args.intensity,
-        source=args.source,
-    )
-    print(json.dumps(_without_embedding(asdict(st)), ensure_ascii=False, indent=2))
-    return 0
+    service = s["sticker"]
+    decision = service.decide(args.need, session_id=args.session)
+    if not decision.pending:
+        print(json.dumps(
+            {"ok": False, "reason": decision.reason}, ensure_ascii=False, indent=2
+        ))
+        return 1
+    deadline = time.monotonic() + float(args.timeout)
+    while time.monotonic() < deadline:
+        for result in service.poll_jobs(limit=4):
+            if result.get("job_id") == decision.job_id:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                return 0 if result.get("ok") else 1
+        time.sleep(2.0)
+    print(json.dumps(
+        {"ok": False, "reason": "cli_timeout", "job_id": decision.job_id},
+        ensure_ascii=False,
+        indent=2,
+    ))
+    return 1
 
 
-def cmd_sticker_search(args: argparse.Namespace) -> int:
+def cmd_sticker_jobs(args: argparse.Namespace) -> int:
     config, db = _bootstrap(args)
     s = _services(config, db)
-    for c in s["sticker"].search(args.need, limit=args.limit):
-        print(f"[{c.score:.3f}] {c.sticker.caption} (id={c.sticker.id[:8]})")
-    return 0
-
-
-def cmd_sticker_decide(args: argparse.Namespace) -> int:
-    config, db = _bootstrap(args)
-    s = _services(config, db)
-    d = s["sticker"].decide(args.need, session_id=args.session)
-    payload = {
-        "send": d.send,
-        "reason": d.reason,
-        "score": d.score,
-        "sticker": _without_embedding(asdict(d.sticker)) if d.sticker else None,
-        "candidates": [
-            {"caption": c.sticker.caption, "score": c.score, "id": c.sticker.id}
-            for c in d.candidates[:5]
-        ],
-        "generated": d.generated,
-    }
-    print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    print(json.dumps(
+        s["sticker"].recent_jobs(limit=args.limit), ensure_ascii=False, indent=2
+    ))
     return 0
 
 
@@ -760,12 +755,15 @@ def cmd_context_preview(args: argparse.Namespace) -> int:
     config, db = _bootstrap(args)
     s = _services(config, db)
     recall = s["memory"].recall(args.message, limit_memory=4) if args.recall else None
-    bundle = s["context"].build(args.session, args.message, recall=recall)
+    bundle = s["context"].build(
+        args.session, args.message, recall=recall, platform=args.platform
+    )
     print(bundle.text())
     print("\n--- stats ---")
     print(
         json.dumps(
             {
+                "variant": bundle.variant,
                 "stable_prefix_hash": bundle.stable_prefix_hash[:16],
                 "dynamic_hash": bundle.dynamic_hash[:16],
                 "prefix_hit": bundle.prefix_hit,
@@ -806,7 +804,7 @@ def cmd_demo(args: argparse.Namespace) -> int:
     print(bundle.text())
     print("\n--- decisions ---")
     print("voice:", voice)
-    print("sticker:", sticker.reason, sticker.score)
+    print("sticker:", sticker.reason, sticker.job_id or "-")
     print("wakeup:", wake.id[:8], time.strftime("%H:%M", time.localtime(wake.fire_at)))
     return 0
 
@@ -1445,6 +1443,92 @@ def cmd_qq_send(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_qqbot_status(args: argparse.Namespace) -> int:
+    config, db = _bootstrap(args)
+    try:
+        runtime = Runtime(db, config)
+        adapter = QQBotAdapter(runtime, config)
+        print(json.dumps(adapter.status(), ensure_ascii=False, indent=2, default=str))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_qqbot_run(args: argparse.Namespace) -> int:
+    config, db = _bootstrap(args)
+    if not qqbot_websocket_available():
+        print(
+            "error: websocket-client is required for QQBot. "
+            "Install it with: pip install websocket-client",
+            file=sys.stderr,
+        )
+        return 2
+    # Same single-instance guard as the OneBot adapter: an OS lock, not a pid
+    # file, so a stale file cannot block or double-run the bot.
+    lock = acquire(lock_path(config.data_dir, "qqbot-adapter"))
+    if lock is None:
+        print(
+            "error: another qqbot adapter is already running "
+            f"(lock: {lock_path(config.data_dir, 'qqbot-adapter')})",
+            file=sys.stderr,
+        )
+        return 1
+    runtime = Runtime(db, config)
+    adapter = QQBotAdapter(runtime, config)
+    status = adapter.status()
+    print(
+        f"[qqbot] starting: app_id_set={status['app_id_set']} "
+        f"app_secret_set={status['app_secret_set']} "
+        f"group_enabled={status['group_enabled']} "
+        f"ws_client={status['websocket_client']}",
+        flush=True,
+    )
+    print("[qqbot] waiting for the gateway ...", flush=True)
+    try:
+        adapter.run_forever()
+    except KeyboardInterrupt:
+        print("stopped")
+    finally:
+        adapter.close()
+        lock.release()
+    return 0
+
+
+def cmd_qqbot_send(args: argparse.Namespace) -> int:
+    config = load_config(args.profile, args.config)
+    client = make_qqbot_client(config)
+    scope = "group" if args.group_openid else "c2c"
+    target_id = str(args.group_openid or args.openid or "")
+    try:
+        summary = client.send_proactive(scope, target_id, args.text)
+    except Exception as exc:
+        print(
+            json.dumps(
+                {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 1
+    finally:
+        client.close()
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "scope": scope,
+                "target_id": target_id,
+                "text_chars": len(args.text),
+                "send": summary,
+            },
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    )
+    return 0
+
+
 def cmd_lexicon_list(args: argparse.Namespace) -> int:
     config, db = _bootstrap(args)
     lexicon = LexiconService(db, config)
@@ -1867,24 +1951,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = tts_sub.add_parser("clear-cache")
     p.set_defaults(func=cmd_tts_clear_cache)
 
-    sticker = sub.add_parser("sticker", help="sticker operations")
+    sticker = sub.add_parser("sticker", help="sticker generation")
     sticker_sub = sticker.add_subparsers(dest="sticker_command", required=True)
-    p = sticker_sub.add_parser("add")
-    p.add_argument("file")
-    p.add_argument("--caption", required=True)
-    p.add_argument("--tag", action="append")
-    p.add_argument("--intent", action="append")
-    p.add_argument("--intensity", type=float, default=2.0)
-    p.add_argument("--source", default="library")
-    p.set_defaults(func=cmd_sticker_add)
-    p = sticker_sub.add_parser("search")
-    p.add_argument("need")
-    p.add_argument("--limit", type=int, default=10)
-    p.set_defaults(func=cmd_sticker_search)
-    p = sticker_sub.add_parser("decide")
-    p.add_argument("need")
+    p = sticker_sub.add_parser("generate")
+    p.add_argument("need", help="natural-language sticker request")
     p.add_argument("--session", default="default")
-    p.set_defaults(func=cmd_sticker_decide)
+    p.add_argument("--timeout", type=float, default=600.0)
+    p.set_defaults(func=cmd_sticker_generate)
+    p = sticker_sub.add_parser("jobs")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(func=cmd_sticker_jobs)
 
     p = sub.add_parser("context", help="prompt assembly")
     context_sub = p.add_subparsers(dest="context_command", required=True)
@@ -1892,6 +1968,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("message")
     p.add_argument("--session", default="default")
     p.add_argument("--recall", action="store_true")
+    # 2026-11-15 platform variants: preview the exact prefix an entry point sees.
+    p.add_argument(
+        "--platform",
+        default=None,
+        choices=["qq_private", "qq_group", "desktop", "roam_room", "full"],
+        help="prompt variant to preview (default: infer from --session)",
+    )
     p.set_defaults(func=cmd_context_preview)
 
     p = sub.add_parser("chat", help="handle one user message through the runtime")
@@ -2098,6 +2181,25 @@ def build_parser() -> argparse.ArgumentParser:
     target.add_argument("--group", dest="group_id", default=None, help="group id")
     p.add_argument("--text", required=True)
     p.set_defaults(func=cmd_qq_send)
+
+    qqbot = sub.add_parser("qqbot", help="official QQ Bot adapter (QQ 开放平台)")
+    qqbot_sub = qqbot.add_subparsers(dest="qqbot_command", required=True)
+    qqbot_sub.add_parser(
+        "status", help="show official QQ Bot config and connection state"
+    ).set_defaults(func=cmd_qqbot_status)
+    qqbot_sub.add_parser(
+        "run", help="connect to the QQ Bot gateway and serve messages"
+    ).set_defaults(func=cmd_qqbot_run)
+    p = qqbot_sub.add_parser(
+        "send", help="send one proactive text as a connectivity test"
+    )
+    bot_target = p.add_mutually_exclusive_group(required=True)
+    bot_target.add_argument("--openid", default=None, help="C2C user openid")
+    bot_target.add_argument(
+        "--group-openid", dest="group_openid", default=None, help="group openid"
+    )
+    p.add_argument("--text", required=True)
+    p.set_defaults(func=cmd_qqbot_send)
 
     lex = sub.add_parser("lexicon", help="expression library: list, review, mine, add")
     lex_sub = lex.add_subparsers(dest="lexicon_command", required=True)

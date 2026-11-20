@@ -27,8 +27,8 @@
 
 用法
 ----
-    python scripts/napcat_supervisor.py --uin <uin>
-    python scripts/napcat_supervisor.py --uin <uin> --kill-desktop
+    python scripts/napcat_supervisor.py --uin 9999000003
+    python scripts/napcat_supervisor.py --uin 9999000003 --kill-desktop
 
 日志：`data/logs/napcat-supervisor.jsonl`（每行一个事件，含在线时长）。
 """

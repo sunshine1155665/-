@@ -200,7 +200,7 @@ class CollectorIngestTests(unittest.TestCase):
         digest2 = self.db.query_one(
             "SELECT origin_scope FROM memory_items "
             "WHERE source_type='qzone' AND source_id LIKE 'digest:%' "
-            "ORDER BY created_at DESC LIMIT 1"
+            "ORDER BY rowid DESC LIMIT 1"
         )
         self.assertEqual(digest2["origin_scope"], "qzone")
 

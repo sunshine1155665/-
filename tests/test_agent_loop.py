@@ -57,11 +57,12 @@ OWNER_UIN = "10001"
 OWNER_SESSION = f"qq:private:{OWNER_UIN}"
 
 REPLY_PLAN = json.dumps({"messages": ["嗯，本鲸鱼娘在听"]}, ensure_ascii=False)
-# T-0029: the same reply carrying the continue tags. desire 0.4 + an open
-# thread arms a ONE-rung ladder (the always-hang +60s hook is gone: without
-# a signal a finished turn now stays silent).
+# T-0029: the same reply carrying the continue tags. desire 0.2 (below the
+# shipped coax_desire_low=0.35) + an open thread arms a ONE-rung ladder (the
+# always-hang +60s hook is gone: without a signal a finished turn now stays
+# silent).
 REPLY_TAGGED = json.dumps(
-    {"messages": ["嗯，本鲸鱼娘在听"], "continue": {"thread_open": True, "desire": 0.4}},
+    {"messages": ["嗯，本鲸鱼娘在听"], "continue": {"thread_open": True, "desire": 0.2}},
     ensure_ascii=False,
 )
 CONTINUE_PLAN = json.dumps(

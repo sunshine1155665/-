@@ -1,120 +1,81 @@
-"""Sticker service: intent -> candidates -> rerank -> send / ComfyUI fallback.
+"""Sticker generation: one ``send_sticker`` action -> one ModelScope LoRA job.
 
-The persona never sees the taxonomy. It calls send_sticker(need=...).
+The library/retrieval era is over.  Stickers are no longer selected from a
+local collection with vector search; every request is rendered fresh by the
+``whalegirl-sticker-v1`` LoRA on ModelScope's turbo base.  The submit is
+synchronous and fast; polling and download happen in :meth:`poll_jobs`, driven
+by ``Runtime.tick``, and the finished PNG is queued as an image message so the
+current reply never waits for the render.
+
+Job rows live in ``sticker_jobs`` only.  The generation prompt never enters
+conversation turns, memory or RAG -- same isolation rule as ``photo_jobs``.
 """
 
 from __future__ import annotations
 
-import heapq
-import json
-import math
-import re
+import os
 import time
 import uuid
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Iterator, Protocol
+from dataclasses import dataclass
+from typing import Any
 
 from ..config import Config
 from ..db import Database
-from ..memory.embedder import (
-    HTTP_BACKENDS,
-    Embedder,
-    build_embedder,
-    cosine,
-    dumps,
-    loads,
-    pack_embedding,
-)
-from .emotion import emotion_intensity
-from .generator import BaseStickerGenerator
-from .lexicon import expand_query
-from .intent import (
-    INTENT_KEYWORDS,
-    INTENT_PRIORITY,
-    MAX_INTENTS,
-    IntentGuess,
-    RuleClassifier,
-    build_classifier,
-    score_intents,
+from ..photo.modelscope import (
+    DEFAULT_BASE_URL,
+    ModelScopePhotoClient,
+    ModelScopePhotoError,
 )
 
-# How much a mismatch between the request's strength and the sticker's strength
-# costs. Comes out of a 0-1 score, and 4 levels of mismatch (1 vs 5) should be
-# enough to lose to a slightly worse-scored but better-pitched candidate.
-INTENSITY_PENALTY = 0.12
-
-
-def sticker_index_text(
-    caption: str,
-    tags: list[str] | None,
-    intents: list[str] | None,
-    content: dict[str, Any] | None,
-) -> str:
-    """The text a sticker's vector is built from.
-
-    Scene text wins when it exists. Measured on the 22-case golden set, keeping
-    ``tags`` in the index is what sank retrieval: about half of them describe the
-    picture ("女仆", "蓝发", "动漫", "表情包"), which says nothing about *when*
-    to send it, and they drowned out the one useful phrase. With scene text
-    alone, bge-base went from 1/22 to 9/22 top-1 and average rank 42 -> 9.
-
-    A sticker that has no scene text yet keeps the old caption+tags+intents
-    text, so a freshly imported image still matches on something.
-    """
-    usage = str((content or {}).get("usage_description") or "").strip()
-    if usage:
-        return usage
-    parts = [caption or "", " ".join(tags or []), " ".join(intents or [])]
-    return " ".join(part for part in (p.strip() for p in parts) if part)
-
-
-class ComfyUIAdapter(Protocol):
-    def generate(self, need: str, context: dict[str, Any] | None = None) -> str | None: ...
-
-
-class DisabledComfyUI:
-    def generate(self, need: str, context: dict[str, Any] | None = None) -> str | None:
-        return None
+# Fixed anchor: identity + sticker style.  The variable part is the model's
+# natural-language need, appended after it.  Keep this in sync with the LoRA
+# training captions (work/lora-sticker-train, trigger whalegirl_sticker).
+ANCHOR = (
+    "chibi, 表情包贴纸，厚白色描边，扁平明亮配色，纯色背景，"
+    "蓝色渐变长卷发少女，蓝眼睛，呆毛，鲸鱼耳鳍，白色女仆发饰，蓝色蝴蝶结，"
+    "深蓝色女仆裙，白色围裙绣鲸鱼，身后一条鲸鱼尾巴，单人"
+)
+DEFAULT_MODEL = "Qwen/Qwen-Image-2.1-Turbo"
+DEFAULT_TRIGGER = "whalegirl_sticker"
+MAX_NEED = 200
+# Prompt length guard.  ModelScope caps prompts at 2000 chars; the anchor plus
+# a long need is nowhere near it, but a runaway model rewrite could be.
+MAX_PROMPT = 1500
 
 
 @dataclass(slots=True)
 class Sticker:
+    """Legacy ``stickers`` row, kept only for adapter lookups.
+
+    The QQ adapter can still resolve an id against the old table (rows imported
+    before the switch); new generations never write there.
+    """
+
     id: str
     file_path: str
     caption: str
-    tags: list[str]
-    emotion: dict[str, Any]
-    identity: dict[str, Any]
-    content: dict[str, Any]
-    intents: list[str]
-    intensity: float
-    style: str
-    source: str
-    usage_count: int
-    embedding: list[float] | None
-
-
-@dataclass(slots=True)
-class StickerCandidate:
-    sticker: Sticker
-    score: float
-    similarity: float
-    keyword: float
+    source: str = "library"
 
 
 @dataclass(slots=True)
 class StickerDecision:
-    send: bool
+    """Outcome of one ``send_sticker`` action.
+
+    ``pending`` means a generation job was accepted; delivery happens later
+    through the outbox.  ``send`` stays False because nothing is sent in-turn
+    any more -- it exists so old callers can keep reading the field without a
+    KeyError.
+    """
+
+    pending: bool
     reason: str
-    score: float = 0.0
-    sticker: Sticker | None = None
-    candidates: list[StickerCandidate] = field(default_factory=list)
-    generated: bool = False
-    # 0-5, how charged the message looked. Reported even when the answer is
-    # "no", because "it matched but the moment was flat" is a different failure
-    # from "nothing matched" and they need different fixes.
-    emotion: float = 0.0
+    job_id: str | None = None
+    caption: str = ""
+    send: bool = False
+
+    @property
+    def generated(self) -> bool:
+        return self.pending
 
 
 class StickerService:
@@ -122,598 +83,368 @@ class StickerService:
         self,
         db: Database,
         config: Config,
-        embedder: Embedder | None = None,
-        comfyui: ComfyUIAdapter | None = None,
-        llm: Any | None = None,
-        classifier: Any | None = None,
+        client: Any | None = None,
     ):
         self.db = db
         self.config = config
-        # Stickers may use a stronger embedder than the rest of the system.
-        # Memory RAG keeps its own backend: switching it would invalidate every
-        # stored vector in memory_items/rag_chunks, and nobody measured that.
-        backend = str(
-            config.get("sticker.embedding_backend")
-            or config.get("memory.embedding_backend", "hash")
+        self.enabled = bool(config.get("sticker.generation_enabled", True))
+        self.model = str(config.get("sticker.generation_model") or DEFAULT_MODEL).strip()
+        raw_loras = config.get("sticker.generation_loras", []) or []
+        if isinstance(raw_loras, str):
+            raw_loras = [raw_loras]
+        self.loras = [str(item).strip() for item in raw_loras if str(item).strip()]
+        self.trigger = str(
+            config.get("sticker.generation_trigger") or DEFAULT_TRIGGER
+        ).strip()
+        self.negative = str(config.get("sticker.generation_negative") or "").strip()
+        self.steps = max(1, min(100, int(config.get("sticker.generation_steps", 8))))
+        self.guidance = float(config.get("sticker.generation_guidance", 1.0))
+        self.size = str(config.get("sticker.generation_size") or "1024x1024").strip()
+        self.max_per_10m = max(
+            0, int(config.get("sticker.generation_max_per_10m", 3))
         )
-        self.embedder = embedder or build_embedder(
-            backend,
-            # HTTP 后端的宽度由服务决定，不该拿 memory.embedding_dim 去预填：
-            # 预填 256 会让「宽度是否一致」的启动检查当场误报（本库是 768）。
-            0 if backend.strip().lower() in HTTP_BACKENDS
-            else int(config.get("memory.embedding_dim", 256)),
-            url=config.get("sticker.embedding_url") or config.get("memory.embedding_url"),
-            timeout=float(config.get("sticker.embedding_timeout_seconds", 10.0)),
+        self.max_pending = max(
+            1, int(config.get("sticker.generation_max_pending", 1))
         )
-        self.comfyui = comfyui or DisabledComfyUI()
-        # Rules stay the last line of defence: a sticker is never worth stalling
-        # a turn, so an unavailable classifier must not block the reply.
-        self.classifier = classifier or build_classifier(config, llm)
-        self.rule_classifier = RuleClassifier()
-        self.threshold = float(config.get("sticker.intent_threshold", 0.5))
-        self.explicit_threshold = float(
-            config.get("sticker.explicit_threshold", 0.20)
+        self.timeout = max(
+            30.0, float(config.get("sticker.modelscope_timeout_seconds", 600.0))
         )
-        self.max_candidates = int(config.get("sticker.max_candidates", 20))
-        # A second, orthogonal gate: similarity says "this picture fits the
-        # occasion", this says "the moment is charged enough to bother". 0
-        # disables it and restores the old behaviour exactly.
-        # Measured on the 40-sentence baseline (staging_spontaneous.py): at 2.0
-        # the task group tops out at 1.60 and 19/20 emotional sentences pass,
-        # so the two gates can be tuned independently -- lowering the
-        # similarity threshold for recall no longer lets task-ish chit-chat
-        # through, because those sentences have no feeling in them.
-        self.min_emotion = max(0.0, float(config.get("sticker.min_emotion_intensity", 0.0)))
-        # The 0.45 similarity weight above was calibrated against hashing
-        # vectors, whose cosines spread over 0-0.4. bge-base cosines on this
-        # library are compressed into 0.34-0.60, so the same weight contributes
-        # almost nothing and the semantic signal goes quiet. Stretching with
-        # fixed anchors (rather than per-request min-max) restores it without
-        # destroying the absolute level, which the send threshold still needs:
-        # per-request normalisation pins the best candidate at 1.0 and made the
-        # service send a sticker on 9 of 10 ordinary sentences.
-        # Defaults are a no-op, so the hash backend keeps its old behaviour.
-        self.sim_floor = float(config.get("sticker.similarity_floor", 0.0))
-        self.sim_ceil = float(config.get("sticker.similarity_ceil", 1.0))
-        # Keep the default path bit-identical to the un-calibrated one.
-        self._calibrating = (self.sim_floor, self.sim_ceil) != (0.0, 1.0)
-        self.width_warning: str | None = self._check_stored_width()
-        # "The library has nothing close, so draw one" is only acceptable when
-        # somebody asked for a picture. Allowing it on the spontaneous path
-        # turns ``intent_threshold`` into decoration, because a fresh meme is
-        # scored 1.0 by construction.
-        self.spontaneous_generation = bool(
-            config.get("sticker.base_generation_spontaneous", False)
+        self.poll_seconds = max(
+            0.5, float(config.get("sticker.modelscope_poll_seconds", 3.0))
         )
-        self.base_generator = (
-            BaseStickerGenerator(db, config, self)
-            if bool(config.get("sticker.base_generation_enabled", True))
-            else None
+        base_url = str(
+            config.get("sticker.modelscope_base_url") or DEFAULT_BASE_URL
+        ).strip()
+        key_env = str(
+            config.get("sticker.modelscope_api_key_env") or "MODELSCOPE_API_KEY"
+        ).strip()
+        api_key = os.environ.get(key_env, "").strip()
+        self.output_dir = config.data_dir / "stickers" / "generated"
+        if client is not None:
+            self.client = client
+        elif api_key and self.model and self.loras:
+            self.client = ModelScopePhotoClient(
+                base_url=base_url,
+                api_key=api_key,
+                model=self.model,
+                timeout=self.timeout,
+                poll_seconds=self.poll_seconds,
+                size=self.size,
+                extra_params={
+                    "loras": list(self.loras),
+                    "steps": self.steps,
+                    "guidance": self.guidance,
+                },
+            )
+        else:
+            self.client = None
+
+    # ------------------------------------------------------------------ config
+    @property
+    def available(self) -> bool:
+        return bool(
+            self.enabled
+            and self.client is not None
+            and getattr(self.client, "available", True)
+            and self.model
         )
 
-    def _check_stored_width(self) -> str | None:
-        """Warn when the table's vectors cannot match the current embedder.
+    def build_prompt(self, need: str) -> str:
+        """Anchor + the model's need; the trigger word appears exactly once."""
+        text = str(need or "").strip()[:MAX_NEED]
+        prompt = f"{self.trigger}, {ANCHOR}"
+        if text:
+            prompt = f"{prompt}，{text}"
+        return prompt[:MAX_PROMPT]
 
-        Switching backends without re-embedding is the one failure mode that
-        looks like nothing is wrong: every similarity is 0, so ranking silently
-        falls back to keyword overlap and the sticker service gets worse
-        without saying anything. Probing one row is cheap; probing them all
-        would mean parsing every vector on startup.
+    # ------------------------------------------------------------------ limits
+    def _count(self, sql: str, params: tuple[Any, ...]) -> int:
+        try:
+            row = self.db.query_one(sql, params)
+        except Exception:  # noqa: BLE001 - a missing table must not kill a turn
+            return 0
+        if row is None:
+            return 0
+        try:
+            return int(row["n"])
+        except (KeyError, TypeError, ValueError):
+            return 0
+
+    def _recent_count(self, now: float) -> int:
+        if self.max_per_10m <= 0:
+            return 0
+        return self._count(
+            "SELECT COUNT(*) AS n FROM sticker_jobs WHERE created_at >= ?",
+            (now - 600.0,),
+        )
+
+    def _pending_count(self) -> int:
+        return self._count(
+            "SELECT COUNT(*) AS n FROM sticker_jobs "
+            "WHERE status IN ('waiting','running')",
+            (),
+        )
+
+    # ------------------------------------------------------------------ submit
+    def decide(
+        self,
+        need: str,
+        *,
+        session_id: str | None = None,
+        force: bool = False,
+        user_text: str | None = None,
+        context_text: str | None = None,
+        intensity: float | None = None,
+        now: float | None = None,
+    ) -> StickerDecision:
+        """Submit one generation job (or refuse).  Never blocks on the render.
+
+        ``force``/``user_text``/``context_text``/``intensity`` are accepted for
+        call-site compatibility; generation no longer ranks candidates, so they
+        do not change the prompt.  The model's ``need`` is already its own
+        rewrite and is the best description we have.
         """
+        if not self.available:
+            return StickerDecision(False, "generation_unavailable")
+        now = time.time() if now is None else now
+        if self._pending_count() >= self.max_pending:
+            return StickerDecision(False, "busy")
+        if self.max_per_10m and self._recent_count(now) >= self.max_per_10m:
+            return StickerDecision(False, "rate_limited")
+        caption = str(need or "").strip()[:MAX_NEED]
+        if not caption:
+            return StickerDecision(False, "missing_need")
+        prompt = self.build_prompt(caption)
+        job_id = uuid.uuid4().hex[:16]
+        try:
+            payload = self.client.build_payload(
+                prompt,
+                self.negative,
+                seed=None,
+                width=_side(self.size),
+                height=_side(self.size),
+            )
+            task_id = self.client.submit(payload)
+        except ModelScopePhotoError as exc:
+            return StickerDecision(False, f"generation_failed:{exc.error_text}")
+        except Exception as exc:  # noqa: BLE001 - one bad submit must not kill a turn
+            return StickerDecision(
+                False, f"generation_failed:{type(exc).__name__}"
+            )
+        self.db.execute(
+            "INSERT INTO sticker_jobs(id, session_id, created_at, status, "
+            "provider, task_id, request_text, updated_at, prompt, caption) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                job_id,
+                str(session_id or "")[:120],
+                now,
+                "waiting",
+                "modelscope",
+                task_id,
+                caption,
+                now,
+                prompt,
+                caption,
+            ),
+        )
+        return StickerDecision(True, "generation_queued", job_id=job_id, caption=caption)
+
+    # ------------------------------------------------------------------ poll
+    def poll_jobs(
+        self,
+        *,
+        now: float | None = None,
+        limit: int = 2,
+    ) -> list[dict[str, Any]]:
+        """Poll due jobs once; download successes and mark failures."""
+        now = time.time() if now is None else now
+        if not self.available:
+            return []
+        try:
+            rows = self.db.query(
+                "SELECT id, session_id, created_at, task_id, caption "
+                "FROM sticker_jobs WHERE status IN ('waiting','running') "
+                "ORDER BY created_at LIMIT ?",
+                (max(1, int(limit)),),
+            )
+        except Exception:  # noqa: BLE001
+            return []
+        completed: list[dict[str, Any]] = []
+        for row in rows:
+            job_id = str(row["id"])
+            session_id = str(row["session_id"] or "")
+            task_id = str(row["task_id"] or "").strip()
+            created_at = float(row["created_at"] or now)
+            if not task_id:
+                self._finish(job_id, "failed", error="missing_task_id")
+                completed.append(
+                    {"ok": False, "job_id": job_id, "session_id": session_id,
+                     "error": "missing_task_id"}
+                )
+                continue
+            if now - created_at > self.timeout + 30.0:
+                self._finish(job_id, "failed", error="modelscope_timeout")
+                completed.append(
+                    {"ok": False, "job_id": job_id, "session_id": session_id,
+                     "error": "modelscope_timeout"}
+                )
+                continue
+            try:
+                result = self.client.poll(task_id)
+                if result.get("status") != "succeeded":
+                    self.db.execute(
+                        "UPDATE sticker_jobs SET updated_at=? WHERE id=?",
+                        (now, job_id),
+                    )
+                    continue
+                url = str(result.get("url") or "").strip()
+                if not url:
+                    raise ModelScopePhotoError(
+                        "modelscope_no_image", "task succeeded without url"
+                    )
+                raw = self.client.download(url)
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+                target = self.output_dir / f"{job_id}{_image_extension(raw)}"
+                tmp = target.with_name(target.name + ".part")
+                tmp.write_bytes(raw)
+                os.replace(tmp, target)
+                self._finish(job_id, "done", image_path=str(target), now=now)
+                completed.append(
+                    {
+                        "ok": True,
+                        "job_id": job_id,
+                        "session_id": session_id,
+                        "path": str(target),
+                        "caption": str(row["caption"] or ""),
+                    }
+                )
+            except ModelScopePhotoError as exc:
+                self._finish(job_id, "failed", error=exc.error_text, now=now)
+                completed.append(
+                    {"ok": False, "job_id": job_id, "session_id": session_id,
+                     "error": exc.error_text}
+                )
+            except Exception as exc:  # noqa: BLE001
+                detail = f"{type(exc).__name__}:{str(exc)[:160]}"
+                self._finish(job_id, "failed", error=detail, now=now)
+                completed.append(
+                    {"ok": False, "job_id": job_id, "session_id": session_id,
+                     "error": detail}
+                )
+        return completed
+
+    def _finish(
+        self, job_id: str, status: str, *, error: str = "", image_path: str = "",
+        now: float | None = None,
+    ) -> None:
+        now = time.time() if now is None else now
+        self.db.execute(
+            "UPDATE sticker_jobs SET status=?, error=?, image_path=?, "
+            "updated_at=?, finished_at=? WHERE id=?",
+            (
+                status,
+                error or None,
+                image_path or None,
+                now,
+                now if status in ("done", "failed") else None,
+                job_id,
+            ),
+        )
+
+    # ------------------------------------------------------------------ views
+    def recent_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
+        try:
+            rows = self.db.query(
+                "SELECT id, session_id, created_at, finished_at, status, "
+                "task_id, request_text, image_path, error FROM sticker_jobs "
+                "ORDER BY created_at DESC LIMIT ?",
+                (max(1, int(limit)),),
+            )
+        except Exception:  # noqa: BLE001
+            return []
+        return [dict(row) for row in rows]
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
         try:
             row = self.db.query_one(
-                "SELECT embedding_text FROM stickers WHERE active=1 AND embedding_text IS NOT NULL LIMIT 1"
+                "SELECT * FROM sticker_jobs WHERE id=?", (str(job_id),)
             )
-        except Exception:  # noqa: BLE001 - a missing table is not our problem here
+        except Exception:  # noqa: BLE001
             return None
-        stored = len(loads(row["embedding_text"]) or []) if row else 0
-        expected = int(getattr(self.embedder, "dim", 0) or 0)
-        # HttpEmbedder only learns its width from the first response, so 0 means
-        # "not asked yet" rather than a mismatch.
-        if not stored or not expected or stored == expected:
+        return dict(row) if row else None
+
+    # ------------------------------------------------------- legacy lookups
+    def get(self, sticker_id: str) -> Sticker | None:
+        """Resolve an old library row (adapter compatibility only)."""
+        try:
+            row = self.db.query_one(
+                "SELECT id, file_path, caption, source FROM stickers WHERE id=?",
+                (str(sticker_id),),
+            )
+        except Exception:  # noqa: BLE001
             return None
-        return (
-            f"贴纸向量宽度 {stored} 与当前后端 {expected} 不一致，相似度会全部为 0。"
-            f"请按当前后端重建向量索引（重算库内全部贴纸向量）。"
+        if not row:
+            return None
+        return Sticker(
+            id=str(row["id"]),
+            file_path=str(row["file_path"] or ""),
+            caption=str(row["caption"] or ""),
+            source=str(row["source"] or ""),
         )
 
     def add_sticker(
         self,
         file_path: str,
         *,
-        caption: str,
-        tags: list[str] | None = None,
-        emotion: dict[str, Any] | None = None,
-        identity: dict[str, Any] | None = None,
-        content: dict[str, Any] | None = None,
-        intents: list[str] | None = None,
-        intensity: float = 2.0,
-        style: str = "",
-        source: str = "library",
+        caption: str = "",
         sticker_id: str | None = None,
+        source: str = "library",
+        **_: Any,
     ) -> Sticker:
+        """Seed a legacy row (tests/adapters).  No embedding is computed.
+
+        Kept intentionally tiny: nothing in the runtime writes here any more.
+        """
         sid = sticker_id or uuid.uuid4().hex
-        tags = tags or []
-        intents = intents or []
-        text = sticker_index_text(caption, tags, intents, content)
         now = time.time()
         self.db.execute(
-            "INSERT OR REPLACE INTO stickers(id, file_path, caption, tags_json, emotion_json, identity_json, "
-            "content_json, intent_json, intensity, style, source, usage_count, embedding_text, active, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,COALESCE((SELECT usage_count FROM stickers WHERE id=?),0),?,1,?,?)",
+            "INSERT OR REPLACE INTO stickers(id, file_path, caption, tags_json, "
+            "emotion_json, identity_json, content_json, intent_json, intensity, "
+            "style, source, usage_count, embedding_text, active, created_at, "
+            "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,0,NULL,1,?,?)",
             (
-                sid, str(file_path), caption,
-                json.dumps(tags, ensure_ascii=False),
-                json.dumps(emotion or {}, ensure_ascii=False),
-                json.dumps(identity or {}, ensure_ascii=False),
-                json.dumps(content or {}, ensure_ascii=False),
-                json.dumps(intents, ensure_ascii=False),
-                float(intensity), style, source, sid,
-                pack_embedding(self.embedder.embed(text)), now, now,
+                sid,
+                str(file_path),
+                caption,
+                "[]",
+                "{}",
+                "{}",
+                "{}",
+                "[]",
+                2.0,
+                "",
+                source,
+                now,
+                now,
             ),
         )
-        return self.get(sid)  # type: ignore[return-value]
-
-    def get(self, sticker_id: str) -> Sticker | None:
-        row = self.db.query_one("SELECT * FROM stickers WHERE id=?", (sticker_id,))
-        return self._row_to_sticker(row) if row else None
-
-    def list(self, limit: int = 50) -> list[Sticker]:
-        rows = self.db.query(
-            "SELECT * FROM stickers WHERE active=1 ORDER BY created_at DESC LIMIT ?",
-            (int(limit),),
-        )
-        return [self._row_to_sticker(row) for row in rows]
-
-    def classify_intents(self, need: str) -> list[tuple[str, float]]:
-        """Keyword scoring used for candidate ranking.
-
-        Retrieval keeps the cheap deterministic signal; the contextual
-        classifier only decides *which* intent was asked for.
-        """
-        return score_intents(need)
-
-    def requested_intents(
-        self,
-        need: str,
-        user_text: str | None = None,
-        context_text: str | None = None,
-    ) -> list[str]:
-        """Intents the *user* asked for, in descending fit.
-
-        Delegates to the configured classifier, which reads the recent dialogue
-        and normalises its answer against the taxonomy. ``need`` alone is a
-        poor input: the chat model rewrites the request and likes to add colour
-        ("…带一点撒娇"), which used to lose the one word that mattered.
-
-        The keyword matcher is still consulted when the classifier is off,
-        unavailable, or returns nothing it can validate — this method never
-        returns an empty list because of an infrastructure failure alone.
-        """
-        return self._classify(need, user_text, context_text).labels
-
-    def _classify(
-        self,
-        need: str,
-        user_text: str | None = None,
-        context_text: str | None = None,
-    ) -> IntentGuess:
-        """Classifier answer with a hard whitelist and a rules fallback."""
-        classifier = self.classifier
-        guess = IntentGuess()
-        if not isinstance(classifier, RuleClassifier):
-            try:
-                guess = classifier.classify(need, user_text, context_text)
-            except Exception:
-                guess = IntentGuess()
-        if not guess:
-            return self.rule_classifier.classify(need, user_text, context_text)
-        # Whatever the backend says, only taxonomy labels leave this method.
-        # "Naturally valid output" is enforced here, not asked for.
-        ordered: list[tuple[str, float]] = []
-        for name, score in guess:
-            label = str(name)
-            if label in INTENT_KEYWORDS and all(label != kept for kept, _ in ordered):
-                ordered.append((label, float(score)))
-        if not ordered:
-            return self.rule_classifier.classify(need, user_text, context_text)
-        # Backends that only answer labels (older stubs, rules) simply leave the
-        # second dimension unset.
-        return IntentGuess(
-            ordered[:MAX_INTENTS], getattr(guess, "intensity", None)
-        )
-
-    @staticmethod
-    def _best_for(
-        requested: list[str],
-        candidates: list["StickerCandidate"],
-    ) -> "StickerCandidate | None":
-        """Best candidate that actually matches what was asked for.
-
-        Walking the requested intents in order keeps a weaker *scene* match
-        ahead of a stronger *mood* match: a sleepy sticker beats a pouting one
-        for "晚安，带一点撒娇" even when the pout scores higher.
-        """
-        if not candidates:
-            return None
-        if not requested:
-            return candidates[0]
-        for intent in requested:
-            for cand in candidates:
-                if intent in cand.sticker.intents:
-                    return cand
-        return None
-
-    def search(self, need: str, limit: int = 10) -> list[StickerCandidate]:
-        return self._rank(
-            need,
-            "SELECT * FROM stickers WHERE active=1 ORDER BY created_at DESC LIMIT 5000",
-            (),
-            limit,
-        )
-
-    def search_by_intents(
-        self, intents: list[str], need: str, limit: int = 8
-    ) -> list[StickerCandidate]:
-        """Shortlist restricted to the intents that were actually asked for.
-
-        ``search()`` ranks by blended similarity, so a rare intent can be pushed
-        out of the top-N entirely: there is exactly one ``goodnight`` sticker in
-        the library, and it never survives a ranking dominated by the 62
-        ``meme`` ones. Without this, a correct classification still ends up
-        synthesising a sticker from a base image.
-        """
-        wanted = [name for name in intents if name in INTENT_KEYWORDS][:MAX_INTENTS]
-        if not wanted:
-            return []
-        clause = " OR ".join("intent_json LIKE ?" for _ in wanted)
-        # Rank these by the classifier's own belief, not by keyword hits on the
-        # request text: that is the whole point of asking a classifier.
-        belief = [(name, 1.0 - 0.15 * index) for index, name in enumerate(wanted)]
-        return self._rank(
-            need,
-            f"SELECT * FROM stickers WHERE active=1 AND ({clause}) "
-            "ORDER BY created_at DESC LIMIT 5000",
-            tuple(f'%"{name}"%' for name in wanted),
-            limit,
-            intent_scores=belief,
-        )
-
-    def _rank(
-        self,
-        need: str,
-        sql: str,
-        params: tuple[Any, ...],
-        limit: int,
-        intent_scores: list[tuple[str, float]] | None = None,
-    ) -> list[StickerCandidate]:
-        # 查询侧同义词扩展，但**不稀释**：相似度取 max(原句, 扩展) 两个向量。
-        # 只用扩展向量会让本来就匹配的查询被别名 token 稀释（实测晚安查询
-        # 0.545 -> 0.453），丢掉恰好卡在阈值上的匹配；只用原句则「惊到」
-        # 桥不到「惊讶」。关键词通道回到原句，理由同前：原话出现和意思
-        # 相近是两个信号，混在一起会让规则分类器吃到自己没见过的词。
-        expanded = expand_query(need)
-        qvecs = [self.embedder.embed(need)]
-        if expanded != need:
-            qvecs.append(self.embedder.embed(expanded))
-        qlower = need.lower()
-        if intent_scores is None:
-            intent_scores = self.classify_intents(need)
-        q_tokens = _tokens_for_overlap(need)
-        span = self.sim_ceil - self.sim_floor
-
-        def scored() -> Iterator[StickerCandidate]:
-            # Stream the table instead of materialising every sticker and two
-            # parallel similarity lists.  At the 5000-row cap each 768-float
-            # embedding is ~24 KB of Python floats, so the old shape could
-            # allocate well over 100 MB for one decision; ``nlargest`` keeps
-            # only the rows that can actually be returned.
-            for row in self.db.execute(sql, params):
-                sticker = self._row_to_sticker(row)
-                # A vector written by another backend has a different width (256
-                # for hash, 768 for bge-base). ``cosine`` truncates to the
-                # shorter one without complaining, which would turn a backend
-                # switch into silent noise. Score it 0 instead and let
-                # keyword/intent carry the row.
-                embedding = sticker.embedding
-                width_ok = bool(embedding) and bool(qvecs[0]) and len(embedding) == len(qvecs[0])
-                raw = max(cosine(qv, embedding) for qv in qvecs) if width_ok else 0.0
-                # ``similarity`` on the candidate stays the raw cosine because
-                # the web debug view shows it to a human; the stretched value
-                # only feeds the score, where the spread matters.
-                sim = raw
-                if self._calibrating and span > 1e-6:
-                    sim = _clip01((raw - self.sim_floor) / span)
-                hay = (
-                    f"{sticker.caption} {' '.join(sticker.tags)} "
-                    f"{' '.join(sticker.intents)}"
-                ).lower()
-                # 场景描述（"想要被摸头、求安慰"）比画面描述（"闭眼合掌，鲸鱼尾巴"）
-                # 更贴近「用户此刻想要什么」，查询词能直接落在它上面。
-                usage = str(sticker.content.get("usage_description") or "").lower()
-                if usage:
-                    hay = f"{hay} {usage}"
-                keyword = (
-                    1.0
-                    if qlower and qlower in hay
-                    else _overlap(q_tokens, _tokens_for_overlap(hay))
-                )
-                intent_bonus = 0.0
-                for intent, prob in intent_scores:
-                    if intent in sticker.intents:
-                        intent_bonus = max(intent_bonus, prob)
-                score = 0.45 * sim + 0.25 * keyword + 0.30 * intent_bonus
-                if score <= 0.03:
-                    continue
-                yield StickerCandidate(
-                    sticker=sticker,
-                    score=round(score, 6),
-                    similarity=round(raw, 6),
-                    keyword=round(keyword, 6),
-                )
-
-        return heapq.nlargest(max(1, int(limit)), scored(), key=lambda c: c.score)
-
-    @staticmethod
-    def _pitch_to_intensity(
-        candidates: list["StickerCandidate"],
-        wanted: float,
-        *,
-        penalty: float = INTENSITY_PENALTY,
-    ) -> list["StickerCandidate"]:
-        """Prefer a sticker whose strength matches the request's.
-
-        The library already stores an intensity per image (2-5) and it was
-        never used for matching, so "气死我了" and "有点烦" landed on the same
-        picture. The adjustment only reorders; the raw score is left untouched
-        because the send thresholds are calibrated against it.
-        """
-        return sorted(
-            candidates,
-            key=lambda cand: cand.score
-            - penalty * abs(float(cand.sticker.intensity) - float(wanted)),
-            reverse=True,
-        )
-
-    def decide(
-        self,
-        need: str,
-        *,
-        context: dict[str, Any] | None = None,
-        threshold: float | None = None,
-        session_id: str | None = None,
-        force: bool = False,
-        user_text: str | None = None,
-        context_text: str | None = None,
-        intensity: float | None = None,
-    ) -> StickerDecision:
-        threshold = self.threshold if threshold is None else float(threshold)
-        # What the *user* said, when we have it: the chat model rewrites the
-        # request into ``need`` and likes to add colour ("带一点撒娇"), so the
-        # paraphrase is the wrong thing to read a thermometer off.
-        emotion = emotion_intensity(user_text or need)
-        candidates = self.search(need, limit=self.max_candidates)
-        guess = (
-            self._classify(need, user_text, context_text) if force else IntentGuess()
-        )
-        requested = guess.labels
-        if requested:
-            # Widen recall for the intents that were actually asked for; the
-            # blended ranking alone can bury a rare label out of sight. Keep the
-            # better of the two scores per sticker — the shortlist ranks by the
-            # classifier's belief, which is usually the more accurate number.
-            merged = {cand.sticker.id: cand for cand in candidates}
-            for cand in self.search_by_intents(requested, need, limit=8):
-                current = merged.get(cand.sticker.id)
-                if current is None or cand.score > current.score:
-                    merged[cand.sticker.id] = cand
-            candidates = sorted(merged.values(), key=lambda c: c.score, reverse=True)
-        if intensity is not None:
-            # The model stated the strength it wants ("别太夸张"), so it wins
-            # over the classifier's guess. This used to be dropped on the floor
-            # even though TOOL_SCHEMA promised the parameter.
-            candidates = self._pitch_to_intensity(candidates, float(intensity))
-        elif requested and guess.intensity is not None:
-            candidates = self._pitch_to_intensity(candidates, guess.intensity)
-        if not force and self.min_emotion and emotion < self.min_emotion:
-            # The second gate. Similarity answers "is this picture about the
-            # right thing"; this answers "is this worth interrupting for". A
-            # flat "嗯" or "我下午要去图书馆" can still scrape past a lowered
-            # threshold, and for a while the only defence was a threshold high
-            # enough to also silence the emotional sentences we wanted.
-            #
-            # Deliberately *after* search: the score is the whole diagnostic
-            # value here. ``emotion_too_flat`` with score 0.71 means the gate
-            # is doing real work; with score 0.22 the sentence was going to be
-            # skipped anyway and lowering ``min_emotion_intensity`` buys
-            # nothing. One embedding round trip on a local CPU port is cheap
-            # next to tuning this blind.
-            return StickerDecision(
-                send=False,
-                reason="emotion_too_flat",
-                score=candidates[0].score if candidates else 0.0,
-                candidates=candidates,
-                emotion=emotion,
-            )
-        if force:
-            # The chat model supplied the need; trust its judgement about
-            # whether an "angry" image is actually flirtatious. An explicit
-            # request is judged on ``explicit_threshold`` instead of the normal
-            # threshold: with the hash embedder even a good library match only
-            # scores ~0.3, and rejecting it used to send a synthesised sticker
-            # with an unrelated caption instead of the right one that was
-            # already in the library.
-            best = self._best_for(requested, candidates)
-            if best is not None and best.score >= self.explicit_threshold:
-                return StickerDecision(
-                    send=True,
-                    reason="explicit_request",
-                    score=best.score,
-                    sticker=best.sticker,
-                    candidates=candidates,
-                    emotion=emotion,
-                )
-            if self.base_generator is not None:
-                generated = self.base_generator.generate(
-                    need, context, intents=requested
-                )
-                if generated is not None:
-                    return StickerDecision(
-                        send=True,
-                        reason="generated_from_base",
-                        score=1.0,
-                        sticker=generated,
-                        candidates=candidates,
-                        generated=True,
-                        emotion=emotion,
-                    )
-            if best is not None:
-                return StickerDecision(
-                    send=True,
-                    reason="explicit_request_low_score",
-                    score=best.score,
-                    sticker=best.sticker,
-                    candidates=candidates,
-                    emotion=emotion,
-                )
-            # Nothing in the library matches and synthesis failed. Sending a
-            # generic sticker here is what put a pouting "才不是" behind a
-            # goodnight request: staying silent is the lesser evil.
-            return StickerDecision(
-                send=False,
-                reason="no_matching_sticker",
-                score=candidates[0].score if candidates else 0.0,
-                candidates=candidates,
-                emotion=emotion,
-            )
-        elif candidates and candidates[0].score >= threshold:
-            return StickerDecision(
-                send=True,
-                reason="library_match",
-                score=candidates[0].score,
-                sticker=candidates[0].sticker,
-                candidates=candidates,
-                emotion=emotion,
-            )
-        if self.base_generator is not None and self.spontaneous_generation:
-            # Synthesis is a fallback for *asked-for* stickers, not a way for
-            # her to always have something to send. On the spontaneous path it
-            # made the threshold meaningless: ``generate()`` hands back a
-            # sticker scored 1.0, so every sentence that fell below
-            # ``intent_threshold`` came back as a send. Measured on a copy of
-            # the production library with the rate cap lifted
-            # (staging_spontaneous.py --allow-generate): 20/20 on "she should
-            # send" *and* 20/20 on "she should not" -- and 8 of those 20 task
-            # requests got the same fallback caption. With it off: 8/20 and
-            # 0/20.
-            generated = self.base_generator.generate(need, context)
-            if generated is not None:
-                return StickerDecision(
-                    send=True,
-                    reason="generated_from_base",
-                    score=1.0,
-                    sticker=generated,
-                    candidates=candidates,
-                    generated=True,
-                    emotion=emotion,
-                )
-        if bool(self.config.get("sticker.comfyui_enabled", False)):
-            path = self.comfyui.generate(need, context)
-            if path:
-                sticker = self.add_sticker(
-                    path,
-                    caption=need[:80],
-                    tags=[],
-                    intents=[intent for intent, _ in self.classify_intents(need)[:2]],
-                    source="comfyui",
-                )
-                return StickerDecision(
-                    send=True,
-                    reason="comfyui_generated",
-                    score=1.0,
-                    sticker=sticker,
-                    candidates=candidates,
-                    generated=True,
-                    emotion=emotion,
-                )
-        return StickerDecision(
-            send=False,
-            reason="no_suitable_sticker" if not candidates else "below_threshold",
-            score=candidates[0].score if candidates else 0.0,
-            candidates=candidates,
-            emotion=emotion,
-        )
-
-    def record_usage(
-        self,
-        sticker_id: str,
-        *,
-        need: str,
-        session_id: str | None = None,
-        reaction: str | None = None,
-    ) -> None:
-        now = time.time()
-        self.db.execute(
-            "INSERT INTO sticker_usage(sticker_id, session_id, need, sent_at, reaction) VALUES (?,?,?,?,?)",
-            (sticker_id, session_id, need[:500], now, reaction),
-        )
-        self.db.execute(
-            "UPDATE stickers SET usage_count=usage_count+1, last_used_at=? WHERE id=?",
-            (now, sticker_id),
-        )
-
-    @staticmethod
-    def _row_to_sticker(row: Any) -> Sticker:
-        return Sticker(
-            id=row["id"],
-            file_path=row["file_path"],
-            caption=row["caption"],
-            tags=_json_list(row["tags_json"]),
-            emotion=_json_dict(row["emotion_json"]),
-            identity=_json_dict(row["identity_json"]),
-            content=_json_dict(row["content_json"]),
-            intents=_json_list(row["intent_json"]),
-            intensity=float(row["intensity"]),
-            style=row["style"],
-            source=row["source"],
-            usage_count=int(row["usage_count"]),
-            embedding=loads(row["embedding_text"]),
-        )
+        return Sticker(id=sid, file_path=str(file_path), caption=caption, source=source)
 
 
-def _json_list(raw: str | None) -> list[str]:
+def _side(size: str) -> int:
+    """``"1024x1024"`` -> 1024 (payload width/height are informational)."""
     try:
-        value = json.loads(raw or "[]")
-    except json.JSONDecodeError:
-        return []
-    return [str(v) for v in value] if isinstance(value, list) else []
+        return int(str(size).lower().split("x", 1)[0])
+    except (TypeError, ValueError):
+        return 1024
 
 
-def _json_dict(raw: str | None) -> dict[str, Any]:
-    try:
-        value = json.loads(raw or "{}")
-    except json.JSONDecodeError:
-        return {}
-    return value if isinstance(value, dict) else {}
-
-
-def _tokens_for_overlap(text: str) -> set[str]:
-    text = (text or "").lower()
-    tokens: set[str] = set()
-    for match in re.finditer(r"[a-zA-Z0-9_]+", text):
-        tokens.add(match.group(0))
-    chars = re.findall(r"[一-鿿]", text)
-    tokens.update(chars)
-    tokens.update("".join(pair) for pair in zip(chars, chars[1:]))
-    return tokens
-
-
-def _overlap(query_tokens: set[str], hay_tokens: set[str]) -> float:
-    if not query_tokens or not hay_tokens:
-        return 0.0
-    common = len(query_tokens & hay_tokens)
-    return common / max(1, min(len(query_tokens), len(hay_tokens)))
-
-
-def _clip01(value: float) -> float:
-    return 0.0 if value < 0.0 else 1.0 if value > 1.0 else value
+def _image_extension(raw: bytes) -> str:
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return ".webp"
+    return ".png"

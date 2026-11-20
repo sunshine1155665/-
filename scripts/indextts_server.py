@@ -511,6 +511,26 @@ def build_handler(service: IndexTTSService) -> type[BaseHTTPRequestHandler]:
                     },
                 )
                 return
+            if not service.loaded:
+                # Lazy first load: refuse instead of letting TTS race another
+                # model (or the OS) into an OOM.  Only local model loading is
+                # gated; /health and an already-loaded service stay instant.
+                try:
+                    import preflight as _preflight
+
+                    ok, notes, _data = _preflight.check("tts")
+                except Exception:  # noqa: BLE001 - a broken probe must not brick TTS
+                    ok, notes = True, []
+                if not ok:
+                    self._json(
+                        503,
+                        {
+                            "ok": False,
+                            "error": "memory_not_enough",
+                            "detail": "; ".join(notes),
+                        },
+                    )
+                    return
             self._handle_tts()
 
         def _handle_tts(self) -> None:

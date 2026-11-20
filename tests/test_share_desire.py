@@ -164,7 +164,17 @@ class ShareWithOwnerActionTests(ShareDesireTestBase):
         self.assertEqual(2, len(self.runtime.wakeup.list()))
 
     def test_daily_limit_reports_clean_error(self) -> None:
-        self.config._data["wakeup"]["max_per_day"] = 0
+        # ``0`` is "unlimited" since 2026-11-15, so a real quota has to be > 0.
+        # One scheduled wakeup fills a quota of 1; the share then reports a
+        # clean refusal instead of raising through the turn.
+        self.config._data["wakeup"]["max_per_day"] = 1
+        self.runtime.wakeup.schedule(
+            "+1m",
+            intent="check_user",
+            reason="占掉当天唯一名额",
+            session_id="qq:private:1001",
+            now=NOON,
+        )
         results = self.runtime.execute_actions(
             [TurnAction("share_with_owner", {"text": SHARE_TEXT})],
             session_id="qq:private:1001",
@@ -173,7 +183,7 @@ class ShareWithOwnerActionTests(ShareDesireTestBase):
         )
         self.assertFalse(results[0]["ok"])
         self.assertIn("limit", results[0]["error"])
-        self.assertEqual([], self.runtime.wakeup.list())
+        self.assertEqual(1, len(self.runtime.wakeup.list()))
 
 
 # ------------------------------------------------------- wakeup -> delivery

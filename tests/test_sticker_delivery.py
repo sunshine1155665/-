@@ -1,20 +1,24 @@
-"""Regression tests for "the sticker was promised but never sent".
+"""Regression tests for the sticker delivery path.
 
-Observed live: the user asked for a goodnight sticker, the model answered with
-plain prose ("表情包这就来"), and nothing was sent. The JSON envelope carrying
-``actions`` was dropped by the model, so the runtime had nothing to execute.
-Two guards are covered here:
+Observed live (library era): the user asked for a goodnight sticker, the model
+answered with plain prose ("表情包这就来"), and nothing was sent.  Two guards
+still matter after the switch to generation:
 
 * the assistant's own transcript must look like the schema the model has to
   obey, otherwise it imitates its old prose replies and forgets the envelope;
 * an explicit sticker request that comes back without the action is fulfilled
   locally instead of shipping an empty promise.
+
+The delivery path changed: ``send_sticker`` now submits a ModelScope LoRA job
+and the PNG is queued through the outbox by ``Runtime.tick``.  These tests pin
+that async contract with a fake client (the suite is offline).
 """
 
 from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -23,11 +27,44 @@ from fatfish.context import ContextAssembler, ensure_default_persona
 from fatfish.db import Database
 from fatfish.llm import LLMResult, LLMUsage
 from fatfish.memory import MemoryService
-from fatfish.runtime import Runtime, _owes_sticker
-from fatfish.sticker import StickerService
-from fatfish.sticker.generator import BaseStickerGenerator
+from fatfish.runtime import Runtime, TurnAction, _owes_sticker
 
 OWNER_SESSION = "qq:private:10001"
+
+
+class FakeStickerClient:
+    """Offline stand-in for ModelScopePhotoClient."""
+
+    available = True
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+        self.payloads: list[dict] = []
+        self.tasks: dict[str, dict] = {}
+        self.fail = False
+
+    def build_payload(self, positive, negative="", *, seed=None, width=1024, height=1024):
+        return {
+            "prompt": positive,
+            "negative_prompt": negative,
+            "seed": seed,
+            "size": f"{width}x{height}",
+        }
+
+    def submit(self, payload):
+        task_id = f"task-{len(self.tasks) + 1}"
+        self.tasks[task_id] = payload
+        self.prompts.append(str(payload.get("prompt") or ""))
+        self.payloads.append(dict(payload))
+        return task_id
+
+    def poll(self, task_id):
+        if self.fail:
+            return {"status": "failed"}
+        return {"status": "succeeded", "url": "https://example.test/sticker.png"}
+
+    def download(self, url):
+        return b"\x89PNG\r\n\x1a\n" + b"0" * 128
 
 
 def make_env(tmp: Path):
@@ -51,11 +88,16 @@ enabled = false
 enabled = false
 
 [sticker]
-enabled = true
-intent_threshold = 0.5
-explicit_threshold = 0.2
-base_generation_enabled = false
-comfyui_enabled = false
+generation_enabled = false
+
+[proactive_media]
+photo_enabled = true
+sticker_enabled = true
+photo_max_per_day = 0
+sticker_max_per_day = 0
+photo_min_interval_minutes = 0
+sticker_min_interval_minutes = 0
+quiet_hours = []
 """
     path = tmp / "sticker.toml"
     path.write_text(toml, encoding="utf-8")
@@ -76,6 +118,16 @@ def fake_reply(runtime: Runtime, text: str) -> None:
     )
 
 
+def attach_fake_client(runtime: Runtime) -> FakeStickerClient:
+    client = FakeStickerClient()
+    service = runtime.sticker
+    service.client = client
+    service.enabled = True
+    service.model = "fake/model"
+    service.max_per_10m = 0  # tests are not about the cost gate
+    return client
+
+
 class StickerDeliveryTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -83,23 +135,16 @@ class StickerDeliveryTests(unittest.TestCase):
         self.config, self.db = make_env(self.tmp)
         self.runtime = Runtime(self.db, self.config)
         self.runtime.owner.bind(OWNER_SESSION, source="cli")
-        self.sticker = StickerService(self.db, self.config)
+        self.client = attach_fake_client(self.runtime)
 
     def tearDown(self) -> None:
         self.db.close()
         self._tmp.cleanup()
 
-    def _seed_sticker(self) -> str:
-        sticker = self.sticker.add_sticker(
-            str(self.tmp / "goodnight.png"),
-            caption="鲸鱼娘晚安 好梦",
-            tags=["晚安", "睡觉"],
-            intents=["goodnight", "comfort"],
-        )
-        return sticker.id
+    def _pending_jobs(self):
+        return self.db.query("SELECT * FROM sticker_jobs")
 
-    def test_prose_reply_still_delivers_the_requested_sticker(self) -> None:
-        self._seed_sticker()
+    def test_prose_reply_still_queues_the_requested_sticker(self) -> None:
         fake_reply(self.runtime, "晚安表情包来啦～软乎乎的那种，给你。\n闭眼吧。")
 
         result = self.runtime.handle_user_message(
@@ -108,13 +153,38 @@ class StickerDeliveryTests(unittest.TestCase):
 
         tools = [item["tool"] for item in result["actions"]]
         self.assertEqual(tools, ["send_sticker"], "请求表情包却没排上动作")
-        self.assertTrue(result["actions"][0]["ok"])
-        self.assertIsNotNone(result["sticker"], "promised a sticker, sent nothing")
-        usage = self.db.query("SELECT * FROM sticker_usage")
-        self.assertEqual(len(usage), 1, "表情包没记进 usage")
+        self.assertTrue(result["actions"][0]["ok"], "任务没提交成功")
+        sticker = result["sticker"]
+        self.assertIsNotNone(sticker)
+        self.assertTrue(sticker["pending"])
+        jobs = self._pending_jobs()
+        self.assertEqual(len(jobs), 1, "异步任务没有落库")
+        self.assertEqual(jobs[0]["status"], "waiting")
+        self.assertIn("whalegirl_sticker", self.client.prompts[0])
+
+    def test_tick_delivers_the_finished_sticker_once(self) -> None:
+        fake_reply(self.runtime, "来啦～")
+        self.runtime.handle_user_message(OWNER_SESSION, "给我发一张表情包")
+
+        tick = self.runtime.tick()
+
+        self.assertEqual(tick["sticker"]["done"], 1)
+        items = self.db.query(
+            "SELECT * FROM outbox WHERE kind='qq_send_image'"
+        )
+        self.assertEqual(len(items), 1)
+        payload = json.loads(items[0]["payload_json"])
+        self.assertEqual(payload["path"], str(
+            self.config.data_dir / "stickers" / "generated" / f"{self._pending_jobs()[0]['id']}.png"
+        ))
+        # Second tick must not queue the same image again.
+        again = self.runtime.tick()
+        self.assertEqual(again["sticker"]["done"], 0)
+        self.assertEqual(
+            len(self.db.query("SELECT * FROM outbox WHERE kind='qq_send_image'")), 1
+        )
 
     def test_refusal_does_not_trigger_the_automatic_sticker(self) -> None:
-        self._seed_sticker()
         fake_reply(self.runtime, "好，那就不发了。")
 
         result = self.runtime.handle_user_message(
@@ -123,9 +193,9 @@ class StickerDeliveryTests(unittest.TestCase):
 
         self.assertEqual(result["actions"], [])
         self.assertIsNone(result["sticker"])
+        self.assertEqual(self._pending_jobs(), [])
 
     def test_model_action_is_not_duplicated_by_the_guard(self) -> None:
-        self._seed_sticker()
         fake_reply(
             self.runtime,
             json.dumps(
@@ -147,7 +217,6 @@ class StickerDeliveryTests(unittest.TestCase):
         self.assertEqual(tools.count("send_sticker"), 1)
 
     def test_missing_envelope_is_repaired_in_one_retry(self) -> None:
-        self._seed_sticker()
         calls: list[list[dict]] = []
 
         def chat(messages, **kwargs):
@@ -175,14 +244,13 @@ class StickerDeliveryTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 2, "应该重问一次，且只重问一次")
         self.assertIn("send_sticker", [item["tool"] for item in result["actions"]])
-        self.assertIsNotNone(result["sticker"])
+        self.assertTrue(result["sticker"]["pending"])
         trace = self.db.query_one(
             "SELECT result_json FROM turn_traces ORDER BY at DESC LIMIT 1"
         )
         self.assertTrue(json.loads(trace["result_json"])["json_repaired"])
 
     def test_trace_records_whether_the_sticker_was_synthesised(self) -> None:
-        self._seed_sticker()
         fake_reply(self.runtime, "表情包这就来。")
         self.runtime.handle_user_message(OWNER_SESSION, "给我发张表情包嘛")
 
@@ -192,6 +260,21 @@ class StickerDeliveryTests(unittest.TestCase):
         payload = json.loads(trace["result_json"])
         self.assertTrue(payload["sticker"])
         self.assertTrue(payload["sticker_auto"])
+
+    def test_activity_sticker_is_retargeted_to_owner(self) -> None:
+        # 2026-11-18: spontaneous media from the activity sandbox must land in
+        # the owner's queue, otherwise the poller skips the activity session.
+        results = self.runtime.execute_actions(
+            [TurnAction("send_sticker", {"need": "开心 转圈"})],
+            session_id="activity-20261118-1000",
+            reply="",
+            now=time.time(),
+            proactive_media=True,
+        )
+        self.assertTrue(results[0]["ok"], results)
+        jobs = self._pending_jobs()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["session_id"], OWNER_SESSION)
 
 
 class StickerIntentTests(unittest.TestCase):
@@ -205,128 +288,6 @@ class StickerIntentTests(unittest.TestCase):
     def test_retracted_request_is_not_fulfilled(self) -> None:
         self.assertFalse(_owes_sticker("算了不要表情包了"))
         self.assertFalse(_owes_sticker("别发表情包，好好说话"))
-
-
-class IntentRankingTests(unittest.TestCase):
-    """挑错图的两个真实原因：场景词被情绪词盖过、命中被高阈值挡掉。"""
-
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.tmp = Path(self._tmp.name)
-        self.config, self.db = make_env(self.tmp)
-        self.sticker = StickerService(self.db, self.config)
-
-    def tearDown(self) -> None:
-        self.db.close()
-        self._tmp.cleanup()
-
-    def test_user_words_beat_the_model_paraphrase(self) -> None:
-        # 模型把"晚安"改写成"带着睡意和一点撒娇"，只凭这段会判成 shy。
-        need = "软乎乎的晚安表情包，带着睡意和一点撒娇，适合哄人睡觉"
-        self.assertEqual(
-            self.sticker.requested_intents(need, "晚安(´-ωก`) 给我发一张晚安的表情包吧"),
-            ["goodnight"],
-        )
-        # 没有用户原话时，至少场景词要排在情绪词前面。
-        self.assertEqual(self.sticker.requested_intents(need)[0], "goodnight")
-
-    def test_tie_on_score_is_broken_towards_the_scene(self) -> None:
-        ranked = [name for name, _ in self.sticker.classify_intents("晚安 带一点撒娇")]
-        self.assertEqual(ranked[0], "goodnight", ranked)
-
-    def test_best_candidate_must_match_the_requested_intent(self) -> None:
-        from fatfish.sticker.service import StickerCandidate
-
-        wrong = self.sticker.add_sticker(
-            str(self.tmp / "pout.png"), caption="傲娇小鲸鱼", intents=["shy", "tease"]
-        )
-        right = self.sticker.add_sticker(
-            str(self.tmp / "night.png"), caption="晚安 好梦", intents=["goodnight", "comfort"]
-        )
-        # 分数是错的更高——按分数取第一条就会发出"才不是"。
-        candidates = [
-            StickerCandidate(wrong, 0.90, 0.90, 0.90),
-            StickerCandidate(right, 0.30, 0.30, 0.30),
-        ]
-        picked = StickerService._best_for({"goodnight"}, candidates)
-        self.assertIsNotNone(picked)
-        self.assertEqual(picked.sticker.id, right.id)
-
-    def test_explicit_request_uses_the_low_threshold(self) -> None:
-        # hash 嵌入下好匹配也只有 ~0.3，用 0.5 会被判成"没命中"然后去合成错图。
-        night = self.sticker.add_sticker(
-            str(self.tmp / "night.png"),
-            caption="晚安 好梦",
-            tags=["晚安", "睡觉"],
-            intents=["goodnight", "comfort"],
-        )
-        decision = self.sticker.decide(
-            "软乎乎的晚安表情包，带一点撒娇",
-            user_text="晚安，给我发一张晚安的表情包",
-            force=True,
-        )
-        self.assertTrue(decision.send)
-        self.assertEqual(decision.sticker.id, night.id)
-
-    def test_no_sticker_is_better_than_a_wrong_one(self) -> None:
-        self.sticker.add_sticker(
-            str(self.tmp / "pout.png"), caption="傲娇小鲸鱼", intents=["shy"]
-        )
-        decision = self.sticker.decide(
-            "晚安的表情包", user_text="晚安，来张表情包", force=True
-        )
-        self.assertFalse(decision.send)
-        self.assertEqual(decision.reason, "no_matching_sticker")
-
-
-class GeneratedCaptionTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.tmp = Path(self._tmp.name)
-        self.config, self.db = make_env(self.tmp)
-        self.service = StickerService(self.db, self.config)
-        self.generator = BaseStickerGenerator(self.db, self.config, self.service)
-
-    def tearDown(self) -> None:
-        self.db.close()
-        self._tmp.cleanup()
-
-    def test_goodnight_caption_follows_the_scene(self) -> None:
-        caption = self.generator._fallback_caption(
-            "软乎乎的晚安表情包，带着睡意和一点撒娇", {"goodnight"}
-        )
-        self.assertEqual(caption, "晚安好梦")
-
-    def test_render_without_pillow_raises_a_clear_error(self) -> None:
-        # 纯文字部署可以不装 Pillow；少了它只该在「现画」那一刻报错，
-        # 而不是 import fatfish 的时候就崩（无头云主机上曾因此起不来）。
-        import fatfish.sticker.generator as generator
-
-        original = generator.Image
-        try:
-            generator.Image = None  # type: ignore[assignment]
-            with self.assertRaises(RuntimeError):
-                self.generator._render(None, "晚安", {}, "digest")
-        finally:
-            generator.Image = original  # type: ignore[assignment]
-
-    def test_base_is_chosen_by_the_requested_scene(self) -> None:
-        sleepy = self.service.add_sticker(
-            str(self.tmp / "sleepy.webp"),
-            caption="蓝发鲸鱼女仆",
-            intents=["goodnight", "comfort"],
-            content={"is_base": True},
-        )
-        self.service.add_sticker(
-            str(self.tmp / "pout.webp"),
-            caption="蓝发女仆害羞",
-            intents=["shy", "meme"],
-            content={"is_base": True},
-        )
-        base = self.generator.select_base(
-            "软乎乎的晚安表情包，带着睡意和一点撒娇", preferred_intents={"goodnight"}
-        )
-        self.assertEqual(base.id, sleepy.id)
 
 
 class HistoryEnvelopeTests(unittest.TestCase):

@@ -11,6 +11,7 @@ import base64
 import json
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -221,6 +222,9 @@ enabled = false
 
 [photo]
 enabled = true
+# 2026-11-15: pin the mode -- low.toml now defaults to modelscope (cloud), and
+# a test must never reach the network or submit real ModelScope jobs.
+mode = "local"
 comfyui_url = "{photo_url}"
 comfyui_autostart = {"true" if autostart else "false"}
 comfyui_python = ""
@@ -271,7 +275,26 @@ class PhotoDetectionTests(unittest.TestCase):
     def test_keywords(self) -> None:
         for text in ("拍张照", "拍一张", "自拍一张", "来张照片", "帮我拍照"):
             self.assertTrue(wants_photo(text), text)
-        for text in ("今天好累", "发个表情", "晚安"):
+        # 2026-11-17 云端实测漏掉的真实说法：她只回了「来了来了」，没生成图。
+        for text in (
+            "能再给我发几张图吗？",
+            "多发点表情包和照片吧",
+            "给我发两张照片",
+            "再来几张自拍",
+            "发张图看看",
+            "你先给我发几张照片吧",
+        ):
+            self.assertTrue(wants_photo(text), text)
+        for text in (
+            "今天好累",
+            "发个表情",
+            "晚安",
+            # 引用/评价已有图片：不能误触发新图
+            "你发的图好好笑",
+            "这张照片拍得真好",
+            "刚才那张图呢",
+            "她在群里发的照片",
+        ):
             self.assertFalse(wants_photo(text), text)
 
 
@@ -294,7 +317,49 @@ class PhotoPromptTests(unittest.TestCase):
         self.assertIn("worst quality", prompt.negative)
         self.assertEqual(prompt.caption, "雨夜自拍")
         self.assertEqual(len(llm.calls), 1)
-        self.assertNotIn("session_id", llm.calls[0][1])
+        # 2026-11-15: the gateway requires an x-opencode-session header, so the
+        # prompt build must always carry one (turn session, else a stable
+        # pseudo-session).  Missing it used to 400 and silently fall back.
+        self.assertEqual(llm.calls[0][1].get("session_id"), "photo:prompt")
+        self.assertEqual(prompt.composition, "character")
+        self.assertEqual(prompt.outfit, "default")
+        self.assertIn("maid dress", prompt.positive.lower())
+
+    def test_llm_can_choose_scene_order_and_new_outfit(self) -> None:
+        payload = json.loads(_llm_prompt_json())
+        payload.update(
+            {
+                "composition": "scene",
+                "outfit": "new",
+                "outfit_detail": "white summer sundress with a straw hat",
+            }
+        )
+        llm = FakeLLM(json.dumps(payload, ensure_ascii=False))
+        service = PhotoService(self.config, self.db, llm=llm)
+        prompt = service.build_prompt("穿着新裙子在海边跑")
+        self.assertEqual(prompt.composition, "scene")
+        self.assertEqual(prompt.outfit, "new")
+        self.assertIn("summer sundress", prompt.positive.lower())
+        self.assertNotIn("maid dress", prompt.positive.lower())
+
+    def test_build_prompt_forwards_the_turn_session(self) -> None:
+        """The prompt-build LLM call inherits the conversation's session."""
+        llm = FakeLLM(_llm_prompt_json())
+        service = PhotoService(self.config, self.db, llm=llm)
+        service.build_prompt("自拍一张", session_id="qq:private:10001")
+        self.assertEqual(llm.calls[0][1].get("session_id"), "qq:private:10001")
+
+    def test_fallback_character_first_default_outfit(self) -> None:
+        service = PhotoService(self.config, self.db, llm=None)
+        prompt = service.build_prompt("来自拍一张")
+        self.assertEqual(prompt.composition, "character")
+        self.assertEqual(prompt.outfit, "default")
+        self.assertIn("maid dress", prompt.positive.lower())
+
+    def test_fallback_scene_first_when_action_is_central(self) -> None:
+        service = PhotoService(self.config, self.db, llm=None)
+        prompt = service.build_prompt("在海边跑起来")
+        self.assertEqual(prompt.composition, "scene")
 
     def test_fallback_on_invalid_llm_json(self) -> None:
         service = PhotoService(self.config, self.db, llm=FakeLLM("not json"))
@@ -599,6 +664,33 @@ class PhotoQQTests(unittest.TestCase):
             text="来张照片",
             is_group=group,
         )
+
+    def test_async_photo_outbox_keeps_reply_to(self) -> None:
+        class FakeAsyncPhoto:
+            def __init__(self, path: str):
+                self.path = path
+
+            def poll_modelscope_jobs(self, *, now=None):
+                return [
+                    {
+                        "ok": True,
+                        "job_id": "job-1",
+                        "session_id": "qq:private:1",
+                        "path": self.path,
+                        "caption": "自拍",
+                        "reply_to": "MSG-1",
+                    }
+                ]
+
+        self.runtime.photo = FakeAsyncPhoto(str(self.image))
+        result = self.runtime._poll_photo_jobs(now=time.time())  # noqa: SLF001
+        self.assertEqual(result["done"], 1)
+        row = self.db.query_one(
+            "SELECT payload_json FROM outbox WHERE kind='qq_send_image'"
+        )
+        payload = json.loads(row["payload_json"])
+        self.assertEqual(payload["reply_to"], "MSG-1")
+        self.assertEqual(payload["path"], str(self.image))
 
     def test_private_photo_is_queued_and_sent_as_image(self) -> None:
         queued, errors, item_ids = self.adapter._queue_media_result(  # noqa: SLF001

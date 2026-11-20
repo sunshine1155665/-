@@ -2,13 +2,28 @@
 title: 平台接入
 type: branch
 status: active
-tags: [qq, napcat, onebot, bilibili, qzone, comments, web, cli, permissions]
-updated: 2026-11-01
+tags: [qq, napcat, onebot, bilibili, qzone, comments, web, cli, permissions, prompt, desktop]
+updated: 2026-11-15
 ---
 
 # 平台接入
 
-> 上级：[系统架构](../overview/architecture.md) · 相关：[运行时](runtime.md) · [运营/活动](activity.md) · [运维](ops.md)
+> 上级：[项目总览](../overview/project-status.md) · 相关：[运行时](runtime.md) · [运营/活动](activity.md) · [运维](ops.md) · [ADR-0018](../adr/0018-platform-prompt-variants.md)
+
+## 提示词平台变体（2026-11-15）
+
+不同入口不再共用一个固定前缀：`Runtime.handle_user_message(platform=...)` → `fatfish/prompt_variants.py` 选变体 → `stable_prefix(capabilities)` 只拼该入口能执行的动作块与平台规则。
+
+| 入口 | platform | 变体 | 动作集 |
+|---|---|---|---|
+| QQ 私聊（NapCat） | `qq_private` | `full` | 全部 19 个动作 |
+| QQ 群 | `qq_group` | `qq_group` | 聊天 + 表情包（群规则进前缀；不再带主人私聊工具清单） |
+| 桌宠 `desktop:owner` | `desktop` | `desktop` | 全能力 **− send_voice**（气泡由壳子自动念）+ 桌面规则 |
+| 漫游目标房间 | `roam_room` | `roam_room` | 全能力 + 漫游规则 |
+
+运行时过滤：`qq.read` / `qq.talk` 只在 adapter 实现 `fetch_friend_history` / `fetch_group_history` / `fetch_forward_messages` / `fetch_group_members` 时出现（即 NapCat/OneBot）；`photo` / `sing` 按服务 enabled。**官方腾讯 QQ Bot 接口（`platforms/qqbot.py`）没有历史消息端点，因此官方 Bot 下 `read_chat` / `talk_to` / 上线补回都不可用，提示词里也不会出现它们**；要用读聊天必须走 NapCat。
+
+越权动作由 `PolicyEngine.validate(allowed=...)` 返回 `unsupported_on_platform`（在 trust/安全校验之后，群聊仍报 `group_not_allowed`）。完整决策见 [ADR-0018](../adr/0018-platform-prompt-variants.md)。
 
 ## QQ
 
@@ -17,7 +32,7 @@ updated: 2026-11-01
 | 协议 | NapCat + OneBot v11 正向 WebSocket（3001） |
 | 代码 | `platforms/onebot.py`、`platforms/qq.py`、`platforms/catchup.py` |
 | 能力 | 私聊、群（@ 触发）、文本、语音 `record`、图片、表情包；outbox handler：`qq_send` / `proactive_message` / `friend_share`（T-0012 v3，主动私聊好友位姐姐，原话投递，payload 缺 `friend_uin` 报错不猜测）/ `qq_catchup`（T-0028，安静时段顺延的补回重扫）/ `roam_message` + `roam_notice`（ADR-0014：目标房间开场与主人归位通知，目标必须来自 payload session，群 session 直接拒绝） |
-| 状态 | ✅ 已实机收发（多次连接成功；最近一次 502 是 NapCat 未运行） |
+| 状态 | ✅ 已实机收发（10-22 多次连接成功；10-23 最后一次 502 是 NapCat 未运行） |
 | 依赖 | `.env` 的 `QQ_ACCESS_TOKEN`；NapCat 需本人扫码 |
 | 缺口 | 引用回复未实现；`web/server.py:827` 硬编码 `features.group_chat=False`；掉线自动重连无证据 |
 
@@ -44,19 +59,7 @@ updated: 2026-11-01
 | 代码 | `scripts/napcat_supervisor.py`（只监管，不改 NapCat 配置、不碰 `fatfish/`） |
 | 策略 | 两种离线分开处理：① **令牌仍有效**（进程/网络抖动）→ 指数退避重启 5/15/30/60 分钟，最多 4 次；② **令牌失效**（`自动快速登录失败`）→ **不重启**，等人工扫码 `--scan-timeout`（默认 15 分钟），等不到就停掉 NapCat 退出码 2，避免整小时挂在登录页 |
 | 台账 | `data/logs/napcat-supervisor.jsonl`：每次状态迁移 + 每段在线时长（`sessions`/`online_seconds`），改完能对比；NapCat 控制台输出落 `data/logs/napcat-console.log` |
-| 用法 | `python scripts/napcat_supervisor.py --uin 3631097402 --kill-desktop` |
-| 环境前提 | 桌面 QQ 与便携 QQ 互斥（`start_napcat.bat` 有守卫）；`--kill-desktop` 会先杀桌面 QQ，看门狗若把它拉回来仍会互踢 |
-
-### 掉线监管（2026-10-29）
-
-| 项 | 事实 |
-|---|---|
-| 现象（10-25 实测） | `[KickedOffLine] 你的账号当前登录已失效` 共 5 次，在线 39 分钟 / 1h43 / 57 分钟 / 1h13 / 1h48；**紧跟着 `自动快速登录失败: 你的用户身份已失效`——会话和快速登录令牌一起作废**，所以每次都要人工扫码 |
-| 噪音 | 掉线后 NapCat 在登录页反复取二维码：`Login Error ErrType:1 ErrCode:3` 每 ~2 分钟一次，持续约 40 分钟（不是"登录风暴"，是二维码自动刷新，但客户端整小时挂在登录页本身也是异常特征） |
-| 代码 | `scripts/napcat_supervisor.py`（只监管，不改 NapCat 配置、不碰 `fatfish/`） |
-| 策略 | 两种离线分开处理：① **令牌仍有效**（进程/网络抖动）→ 指数退避重启 5/15/30/60 分钟，最多 4 次；② **令牌失效**（`自动快速登录失败`）→ **不重启**，等人工扫码 `--scan-timeout`（默认 15 分钟），等不到就停掉 NapCat 退出码 2，避免整小时挂在登录页 |
-| 台账 | `data/logs/napcat-supervisor.jsonl`：每次状态迁移 + 每段在线时长（`sessions`/`online_seconds`），改完能对比；NapCat 控制台输出落 `data/logs/napcat-console.log` |
-| 用法 | `python scripts/napcat_supervisor.py --uin <uin> --kill-desktop` |
+| 用法 | `python scripts/napcat_supervisor.py --uin 9999000003 --kill-desktop` |
 | 环境前提 | 桌面 QQ 与便携 QQ 互斥（`start_napcat.bat` 有守卫）；`--kill-desktop` 会先杀桌面 QQ，看门狗若把它拉回来仍会互踢 |
 
 ## QQ 空间（读 + 分享欲写路径）
@@ -119,7 +122,7 @@ python -m fatfish init
 python -m fatfish doctor
 python -m fatfish serve --port 0
 python -m fatfish chat "在吗"
-python -m fatfish nightly --date 2026-10-20
+python -m fatfish nightly --date 2026-10-22
 python -m fatfish memory search "鲸鲸"
 python -m fatfish qq status
 python -m fatfish bilibili browse

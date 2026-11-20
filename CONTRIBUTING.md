@@ -31,7 +31,7 @@
 
 ## GPU / 显存约定（8 GB 卡）
 
-TTS(9880) / 唱歌(SoulX) / ComfyUI(8188) / 向量(9881) **不能同时驻留显存**，租约文件是 `data/run/vram.lock`，产品侧与脚本共用同一把锁。
+TTS(9880) / 唱歌(YuE2→RVC) / ComfyUI(8188) / 向量(9881) **不能同时驻留显存**，租约文件是 `data/run/vram.lock`，产品侧与脚本共用同一把锁。
 
 1. 任何会加载模型的重活之前先过闸门：
 
@@ -64,7 +64,7 @@ TTS(9880) / 唱歌(SoulX) / ComfyUI(8188) / 向量(9881) **不能同时驻留显
 | 单轮编排 | `fatfish/runtime.py`、`fatfish/context.py`、`fatfish/llm.py` |
 | 记忆 | `fatfish/memory/`（`service.py` 检索、`details.py` 细节、`events.py` 事件、`gate.py` 召回闸门） |
 | 语音 | `fatfish/tts/`（引擎在 `.venv-indextts`，9880） |
-| 唱歌 | `soulx/`（SoulX-Singer 子进程链路）+ `fatfish/sing/service.py` |
+| 唱歌 | `soulx/song_yue2_rvc.py`（YuE2→Demucs→RVC 子进程）+ `fatfish/sing/service.py` |
 | 平台 | `fatfish/platforms/`、`fatfish/bilibili/`、`fatfish/qzone/`、`fatfish/web/server.py` |
 | 数据 | SQLite schema（`fatfish/schema.sql` + 幂等迁移） |
 

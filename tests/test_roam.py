@@ -1,4 +1,4 @@
-"""ADR-0014 P0: multi-session roaming, offline and temporary.
+﻿"""ADR-0014 P0: multi-session roaming, offline and temporary.
 
 No network, no real ``data/fatfish.db``.  The scaffold uses the same temp env
 as ``test_p0`` and binds owner + family/teacher/friend rooms directly.
@@ -84,7 +84,7 @@ class SchemaV14Tests(unittest.TestCase):
         self.db.initialize()
 
     def test_tables_columns_and_indexes(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, "14")
+        self.assertEqual(SCHEMA_VERSION, "17")
         tables = {
             row["name"]
             for row in self.db.query("SELECT name FROM sqlite_master WHERE type='table'")
@@ -134,7 +134,7 @@ class SchemaV14Tests(unittest.TestCase):
         old = Database(old_path)
         self.addCleanup(old.close)
         old.initialize()
-        self.assertEqual("14", old.get_meta("schema_version"))
+        self.assertEqual("17", old.get_meta("schema_version"))
         self.assertIn("trip_id", old.columns("conversation_turns"))
         tables = {
             row["name"]

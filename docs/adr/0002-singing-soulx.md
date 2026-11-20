@@ -1,12 +1,15 @@
 ---
 title: ADR-0002 唱歌选用 SoulX-Singer 与规则旋律
 type: adr
-status: accepted
+status: superseded
 tags: [adr, singing, soulx, melody, svs]
 updated: 2026-10-24
 ---
 
 # ADR-0002：唱歌选用 SoulX-Singer 与规则旋律
+
+> **已被 [ADR-0017](0017-singing-all-yue2-rvc.md) 取代（2026-11-10）。** 旧 SoulX 链路
+> 已从主仓删除；本文只保留当时的决策背景与评测记录，不再描述产线。
 
 ## 背景
 

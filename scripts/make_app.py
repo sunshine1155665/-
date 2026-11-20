@@ -9,7 +9,7 @@ Usage:
     python scripts/make_app.py
     python scripts/make_app.py --verify
     python scripts/make_app.py --clean --verify
-    python scripts/make_app.py --dest D:/somewhere/fatfish-app --no-zip
+    python scripts/make_app.py --dest /tmp/fatfish-app --no-zip
 """
 
 from __future__ import annotations
@@ -66,11 +66,14 @@ SCRIPT_FILES = (
     "start_qzone_login.bat",
     "qzone_login_ui.py",
     "napcat_supervisor.py",
-    "fetch_stickers.py",
+    "napcat_watch.py",
     "napcat_qr_mcp.py",
     "napcat_qr_setup.py",
-    "sticker_recall_eval.py",
-
+    "qqbot_service.py",
+    "pet_gateway.py",
+    "sing_server.py",
+    "photo_server.py",
+    "serve_stats.py",
 )
 
 # Subdirectories of scripts/ shipped verbatim with the full bundle.

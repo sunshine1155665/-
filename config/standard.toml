@@ -14,7 +14,7 @@ api_key_env = "FATFISH_OPENCODE_KEY"
 api_style = "chat_completions"
 # user_agent 从包版本单点生成（fatfish/__init__.py），不再在 profile 里写死。
 send_session_header = true
-max_output_tokens = 1000
+max_output_tokens = 4000
 temperature = 0.8
 reasoning_effort = "low"
 timeout_seconds = 120
@@ -49,7 +49,7 @@ event_min_gap_for_topic_minutes = 10
 event_topic_shift_threshold = 0.15
 today_timeline_chars = 1200
 nightly_voice = true
-nightly_voice_max_tokens = 350
+nightly_voice_max_tokens = 4000
 archive_backfill_days = 3
 event_max_per_day = 20
 
@@ -59,7 +59,7 @@ provider = "local"
 min_score = 0.58
 text_with_voice_min = 0.42
 max_per_hour = 6
-max_per_day = 24
+max_per_day = 0                # boss 2026-11-15：不设每日数额限制（0 = 不限）
 
 [chat]
 max_messages_per_turn = 4
@@ -99,17 +99,17 @@ quiet_hours = ["01:00", "08:00"]
 # 多少次动作的抬升量」，hard_cap_per_hour = 0 表示只软限、不硬拦。
 [self_action]
 enabled = true                 # 自主动作默认开；软限（阈值/静默/日上限）照旧生效，想关改 false
-initial_threshold = 0.35
-threshold_step = 0.10
-threshold_floor = 0.20
+initial_threshold = 0.10
+threshold_step = 0.05
+threshold_floor = 0.04
 threshold_ceiling = 0.90
 # 本域单位是「次动作」，不是「条消息」：
-# 派生 threshold_decay_per_minute = 0.10 * 30 / 60 = 0.05/分钟
-decay_events_per_hour = 30
+# 派生 threshold_decay_per_minute = 0.05 * 40 / 60 ≈ 0.033/分钟
+decay_events_per_hour = 40
 hard_cap_per_hour = 0          # 0 = 只软限，不硬拦
-daily_cap = 12                 # 每天自主动作次数兜底
+daily_cap = 0                  # boss 2026-11-15：不设每日数额限制（0 = 不限）
 max_events_per_turn = 2        # 每轮自主动作上限（轮内总动作仍受 4 个约束）
-probe_interval_minutes = 30
+probe_interval_minutes = 20
 quiet_hours = ["01:00", "08:00"]
 
 # ---- 主动找主人（占位，本轮代码不接；T-0052）----
@@ -134,7 +134,7 @@ base_url = "http://127.0.0.1:9880/tts"
 format = "wav"
 text_lang = "zh"
 prompt_lang = "zh"
-ref_audio_path = ""            # 本机参考音频路径（wav），例：D:/voices/ref.wav
+ref_audio_path = ""            # 本机参考音频路径（wav），例：<VOICE_REF>/ref.wav
 prompt_text = ""              # 与 ref_audio_path 配套的参考音频转写
 text_split_method = "cut5"
 media_type = "wav"
@@ -156,30 +156,6 @@ timeout_seconds = 120
 # api_key_env = "LOCAL_TTS_KEY"
 # [tts.headers]
 # X-Local-TTS = "1"
-
-[sticker]
-enabled = true
-library_dir = "stickers"
-comfyui_enabled = true
-comfyui_url = "http://127.0.0.1:8188"
-intent_threshold = 0.60              # 换 bge 向量后分数上移，0.60 才不会在普通对话里乱发图
-explicit_threshold = 0.20
-intent_backend = "hybrid"       # rules | llm | hybrid | kev (kev needs the 8009 server up)
-intent_max_tokens = 400
-intent_cooldown_seconds = 60.0
-base_generation_enabled = true
-# 只在用户明确要图（force）时允许现画；自发路径开着会让阈值失效。
-base_generation_spontaneous = false
-base_generation_max_chars = 12
-base_generation_max_per_10m = 3
-max_candidates = 30
-# 情绪闸门（0~5，0 = 关闭）。和 intent_threshold 正交：那个管图对不对，
-# 这个管这一刻值不值得配图。见 fatfish/sticker/emotion.py。
-min_emotion_intensity = 2.0
-
-# 向量后端与相似度锚点沿用 low.toml 的值（bge-base / 0.42~0.60）。
-# 只在这里覆盖 max_candidates：本 profile 给候选池放宽，前提是排序已经被
-# 真向量接管，否则 30 个候选里前 20 个就已经是噪声。
 
 [photo]
 enabled = true
@@ -226,7 +202,7 @@ reply_energy_cost = 2.0
 enabled = true
 min_delay_seconds = 60
 max_delay_days = 7
-max_per_day = 12
+max_per_day = 0                # boss 2026-11-15：不设每日数额限制（0 = 不限）
 max_chain_depth = 4
 proactive_min_interval_minutes = 60
 quiet_hours_min_confidence = 0.90
@@ -268,7 +244,7 @@ timeout_seconds = 10.0
 review_max_items = 10
 # ---- 写路径（说说发布；boss 授权 2026-10-25：分享欲模型，ADR-0005）----
 # desire ≥ 阈值（默认 0.7）跳过审批直接发布；低于阈值/缺省进审批箱等主人批。
-auto_post_desire_threshold = 0.7
+auto_post_desire_threshold = 0.45
 # 一天最多发布条数（含已排队名额）；0 = 不限制（boss 明示不限次），>0 才生效。
 max_posts_per_day = 0
 # 草稿是否必须人工审批（web/CLI）。false 时由 desire 阈值决定是否跳过审批；
@@ -285,7 +261,7 @@ quiet_hours_end = "08:00"
 # 绑定的姐姐（share_to_friend），别无他人；收件人由绑定行解析，不可配置绕过。
 [share]
 # 每天主动私聊姐姐的上限；0 = 不限制。计数走 decision_log（kind=friend_share）。
-max_to_friend_per_day = 2
+max_to_friend_per_day = 0
 # 安静时段（本地时间 HH:MM）：顺延到时段结束再发。
 quiet_hours_start = "23:30"
 quiet_hours_end = "08:00"
@@ -297,7 +273,7 @@ enabled = true
 interval_minutes = 30
 quiet_hours_start = "23:30"
 quiet_hours_end = "08:00"
-max_llm_turns_per_day = 48
+max_llm_turns_per_day = 0
 bili_browse_interval_minutes = 120
 bili_browse_limit = 3
 share_recency_hours = 6

@@ -16,7 +16,7 @@ Stdlib only.  Optional dependencies and services are detected, never required:
   - ``cosyvoice``: ``.venv-cosyvoice`` + ``models/Fun-CosyVoice3-0.5B`` + a
     soft reference.
 * ``.venv-cosyvoice`` + ``models/bge-base-zh-v1.5`` for the embedding service
-  (only when ``sticker.embedding_backend`` is an HTTP backend)
+  (only when ``memory.embedding_backend`` is an HTTP backend)
 
 The printed web URL contains a per-run login token.  Tokens and cookies are
 never written to the log files (the token in the URL is redacted in logs).
@@ -961,10 +961,10 @@ def embedding_components(config: Any) -> tuple[list[str], Path]:
 
 
 def embedding_enabled(config: Any) -> bool:
-    backend = str(
-        config.get("sticker.embedding_backend")
-        or config.get("memory.embedding_backend", "hash")
-    ).strip().lower()
+    # Sticker retrieval is gone; the embedding server now only exists for the
+    # memory backend (hash on every shipped profile, so 9881 stays down unless
+    # a profile explicitly switches memory to an HTTP backend).
+    backend = str(config.get("memory.embedding_backend", "hash")).strip().lower()
     return backend in EMBED_BACKENDS
 
 
@@ -1033,7 +1033,7 @@ def start_embedding(
         say("[EMB] 已跳过（--web-only / --no-embedding）")
         return None, None
     if not embedding_enabled(config):
-        say("[EMB] 未启用（sticker.embedding_backend=hash），用哈希向量")
+        say("[EMB] 未启用（memory.embedding_backend=hash），用哈希向量")
         return None, None
     pid_path = run_dir / "embedding.pid"
     existing = read_pid(pid_path)
@@ -1327,7 +1327,7 @@ class ServiceRuntime:
             if not embedding_enabled(self.config):
                 raise ControlError(
                     "disabled",
-                    "sticker.embedding_backend 不是 HTTP 后端，用哈希向量就够",
+                    "memory.embedding_backend 不是 HTTP 后端，用哈希向量就够",
                     409,
                 )
 
@@ -1370,6 +1370,7 @@ class ServiceRuntime:
                 server,
                 idle_unload_seconds=tts_idle_unload_seconds(self.config),
                 warmup=tts_warmup(self.config),
+                pitch_semitones=tts_pitch_semitones(self.config),
             ),
             self.logs_dir / "tts.log",
             profile=self.profile,

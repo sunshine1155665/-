@@ -1,4 +1,4 @@
-"""Tests for on-demand singing (SoulX) and its chat/QQ/Web integrations.
+"""Tests for on-demand singing (YuE2 -> RVC) and its chat/QQ/Web integrations.
 
 No model, no GPU and no subprocess: the render step is a fake runner that
 writes the wav the real command would have written.  The vram lease and TTS
@@ -50,6 +50,23 @@ class FakeLLM:
         )
 
 
+class SequenceLLM(FakeLLM):
+    """Returns one canned reply per call; the last one repeats."""
+
+    def __init__(self, *texts: str):
+        super().__init__(texts[-1] if texts else "")
+        self.texts = list(texts)
+
+    def chat(self, messages, **kwargs):
+        self.calls.append({"messages": messages, **kwargs})
+        text = self.texts.pop(0) if self.texts else self.text
+        return LLMResult(
+            text=text,
+            usage=LLMUsage(prompt_tokens=10, completion_tokens=5),
+            model="fake-model",
+        )
+
+
 class FakeTTSBridge:
     """The slice of TTS control SingService uses."""
 
@@ -90,7 +107,7 @@ def make_env(tmp: Path, *, sing_extra: str = ""):
     data.mkdir(parents=True, exist_ok=True)
     python = tmp / "python.exe"
     python.write_bytes(b"")
-    script = tmp / "song_v2.py"
+    script = tmp / "song_yue2_rvc.py"
     script.write_text("# fake renderer\n", encoding="utf-8")
     default_src = tmp / "default.json"
     default_src.write_text(
@@ -222,7 +239,7 @@ class SingServiceTests(unittest.TestCase):
         self.assertEqual(result.title, "等你回家")
         req = self.runner.requests[0]
         self.assertEqual(req.command[0], str(self.tmp / "python.exe"))
-        self.assertEqual(req.command[1], str(self.tmp / "song_v2.py"))
+        self.assertEqual(req.command[1], str(self.tmp / "song_yue2_rvc.py"))
         self.assertIn("--emotion", req.command)
         self.assertEqual(req.command[req.command.index("--emotion") + 1], "genki")
         self.assertIn("--out", req.command)
@@ -256,8 +273,52 @@ class SingServiceTests(unittest.TestCase):
         self.assertEqual(src.name, "lyrics.json")
         payload = json.loads(src.read_text(encoding="utf-8"))
         self.assertEqual([p["text"] for p in payload["phrases"]], lyrics)
+        self.assertEqual(payload["lyrics"], lyrics)
         row = self._job(result.job_id)
         self.assertEqual(json.loads(row["lyrics_json"]), lyrics)
+
+    def test_full_lyrics_with_section_tags_are_kept(self) -> None:
+        lyrics = [
+            "[Verse]",
+            "洗完头发还湿着",
+            "尾巴软软拖在地上",
+            "[Chorus]",
+            "主人哥哥别学太晚",
+            "我在这儿等你回家",
+        ]
+        result = self.service.sing(
+            lyrics=lyrics, session_id="qq:private:1", now=100.0
+        )
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.lyrics, lyrics)
+        self.assertEqual(result.lyrics_error, "")
+        req = self.runner.requests[0]
+        src = Path(req.command[req.command.index("--src") + 1])
+        payload = json.loads(src.read_text(encoding="utf-8"))
+        self.assertEqual(payload["lyrics"], lyrics)
+        # phrases keeps only sung lines; the renderer forwards the tags.
+        self.assertEqual(
+            [p["text"] for p in payload["phrases"]],
+            [line for line in lyrics if not line.startswith("[")],
+        )
+
+    def test_lyrics_count_bounds(self) -> None:
+        result = self.service.sing(
+            lyrics=[f"第{n}句在唱歌呀" for n in range(17)],
+            session_id="qq:private:1",
+            now=100.0,
+        )
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.lyrics, [])
+        self.assertEqual(result.lyrics_error, "lyrics_bad_count")
+        self.assertEqual(
+            self.service.sing(
+                lyrics=[f"第{n}句在唱歌呀" for n in range(4)],
+                session_id="qq:private:1",
+                now=100.0,
+            ).lyrics_error,
+            "",
+        )
 
     def test_bad_lyrics_fall_back_to_the_default_song(self) -> None:
         result = self.service.sing(
@@ -265,7 +326,7 @@ class SingServiceTests(unittest.TestCase):
         )
         self.assertTrue(result.ok, result.error)
         self.assertEqual(result.lyrics, [])
-        self.assertEqual(result.lyrics_error, "lyrics_need_four_lines")
+        self.assertEqual(result.lyrics_error, "lyrics_bad_count")
         src = self.runner.requests[0].command
         self.assertEqual(
             Path(src[src.index("--src") + 1]), self.tmp / "default.json"
@@ -552,6 +613,71 @@ class SingRuntimeTests(unittest.TestCase):
         self.assertEqual(stub.calls[0]["emotion"], "genki")
         self.assertEqual(len(stub.calls[0]["lyrics"]), 4)
 
+    def test_invalid_lyrics_get_one_model_rewrite_round(self) -> None:
+        """ADR-0018 配套：不合格歌词先打回给模型重写，而不是默默唱默认歌。"""
+        bad_lines = ["下雨了", "想你了", "回家吧"]  # 3 句正文 -> lyrics_bad_count
+        fixed_lines = ["窗外下着小雨呀", "我在等你回家呀", "热汤已经煮好了", "快过来抱抱我吧"]
+        self.runtime.llm = SequenceLLM(
+            json.dumps(
+                {
+                    "messages": ["唱给你听。"],
+                    "actions": [
+                        {"tool": "sing", "args": {"emotion": "soft", "lyrics": bad_lines}}
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps({"lyrics": fixed_lines}, ensure_ascii=False),
+        )
+        stub = self._stub()
+        self.runtime.handle_user_message("qq:private:1004", "唱首歌", now=100.0)
+        self.assertEqual(stub.calls[0]["lyrics"], fixed_lines)
+        # 重写那轮是独立的小对话：错误码和原稿都在提示里。
+        rewrite = self.runtime.llm.calls[1]
+        system = rewrite["messages"][0]["content"]
+        self.assertIn("lyrics_bad_count", system)
+        self.assertIn("下雨了", system)
+        self.assertIn("4-16", system)
+
+    def test_still_invalid_rewrite_keeps_service_fallback(self) -> None:
+        bad_lines = ["下雨了", "想你了", "回家吧"]
+        self.runtime.llm = SequenceLLM(
+            json.dumps(
+                {
+                    "messages": ["唱给你听。"],
+                    "actions": [
+                        {"tool": "sing", "args": {"emotion": "soft", "lyrics": bad_lines}}
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            "我不会写 JSON。",  # 重写轮给不出合法 JSON
+        )
+        stub = self._stub()
+        self.runtime.handle_user_message("qq:private:1004", "唱首歌", now=100.0)
+        # 原样转发：服务端 clean_lyrics 失败后落回默认歌（既有兜底不变）。
+        self.assertEqual(stub.calls[0]["lyrics"], bad_lines)
+        self.assertEqual(len(self.runtime.llm.calls), 2)  # 只重写一次
+
+    def test_valid_lyrics_skip_the_rewrite_round(self) -> None:
+        good_lines = ["窗外下着小雨呀", "我在等你回家呀", "热汤已经煮好了", "快过来抱抱我吧"]
+        self.runtime.llm = SequenceLLM(
+            json.dumps(
+                {
+                    "messages": ["唱给你听。"],
+                    "actions": [
+                        {"tool": "sing", "args": {"emotion": "soft", "lyrics": good_lines}}
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            "这一轮不该被用到",
+        )
+        stub = self._stub()
+        self.runtime.handle_user_message("qq:private:1004", "唱首歌", now=100.0)
+        self.assertEqual(stub.calls[0]["lyrics"], good_lines)
+        self.assertEqual(len(self.runtime.llm.calls), 1)  # 没有重写轮
+
 
 class SingQQTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -671,7 +797,7 @@ class SingSchemaTests(unittest.TestCase):
         self.db.initialize()
 
     def test_sing_jobs_table_exists_and_version_is_current(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, "14")
+        self.assertEqual(SCHEMA_VERSION, "17")
         tables = {
             row["name"]
             for row in self.db.query(

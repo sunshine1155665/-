@@ -121,10 +121,19 @@ class PersonaMoneyBlockTests(unittest.TestCase):
 
         for bundle in (owner, group, friend):
             self.assertIn("不差钱", bundle.model_messages()[0]["content"])
-        # Same persona block for every audience: it is one shared prefix.
+        # Same persona block for every audience on the same prompt variant;
+        # since 2026-11-15 the QQ group uses the minimal variant (different
+        # tool section + group rules), so its prefix is deliberately different.
         self.assertEqual(
-            {b.model_messages()[0]["content"] for b in (owner, group, friend)},
+            {
+                owner.model_messages()[0]["content"],
+                friend.model_messages()[0]["content"],
+            },
             {self.assembler.stable_prefix()},
+        )
+        self.assertNotEqual(
+            group.model_messages()[0]["content"],
+            self.assembler.stable_prefix(),
         )
 
 

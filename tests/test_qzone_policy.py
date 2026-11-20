@@ -176,7 +176,8 @@ class ToolSchemaWordingTests(unittest.TestCase):
         self.assertIn("0.8", TOOL_SCHEMA)
         self.assertIn("0.6-0.8", TOOL_SCHEMA)
         self.assertIn("0.3-0.6", TOOL_SCHEMA)
-        self.assertIn("0.7", TOOL_SCHEMA)
+        # 2026-11-15：自动发布渴望阈值 0.7 -> 0.45（boss 下调）。
+        self.assertIn("0.45", TOOL_SCHEMA)
 
     def test_schema_documents_share_with_owner_and_routing(self) -> None:
         self.assertIn("share_with_owner", TOOL_SCHEMA)

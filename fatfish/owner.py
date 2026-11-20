@@ -114,6 +114,20 @@ CREATE TABLE IF NOT EXISTS owner_bindings (
 )
 """
 
+# Extra owner *surfaces* (desktop pet, future local shells) share the single
+# owner relationship without becoming a second owner_bindings row.  This keeps
+# the canonical QQ binding intact while ``desktop:owner`` resolves to owner.
+_SURFACES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS owner_surfaces (
+    session_id TEXT PRIMARY KEY,
+    platform TEXT NOT NULL DEFAULT 'desktop',
+    role TEXT NOT NULL DEFAULT 'owner',
+    display_name TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    last_seen_at REAL
+)
+"""
+
 
 class OwnerRegistry:
     """Persist and answer the owner binding and the single friend slot."""
@@ -135,6 +149,7 @@ class OwnerRegistry:
             config.get("relationship.owner_claim_code", "") or ""
         ).strip()
         self.db.execute(_OWNER_SCHEMA)
+        self.db.execute(_SURFACES_SCHEMA)
         # ``role`` was added after the first release; older databases predate it.
         if "role" not in self.db.columns("owner_bindings"):
             self.db.execute(
@@ -175,7 +190,15 @@ class OwnerRegistry:
                 "SELECT role FROM owner_bindings WHERE session_id=? LIMIT 1", (sid,)
             )
         except Exception:
-            return None
+            row = None
+        if row is None:
+            try:
+                row = self.db.query_one(
+                    "SELECT role FROM owner_surfaces WHERE session_id=? LIMIT 1",
+                    (sid,),
+                )
+            except Exception:
+                row = None
         if row is None:
             return None
         value = str(row["role"] or "").strip().lower()
@@ -191,8 +214,46 @@ class OwnerRegistry:
                 (sid,),
             )
         except Exception:
-            return None
-        return str(row["display_name"]) if row else None
+            row = None
+        if row is None:
+            try:
+                row = self.db.query_one(
+                    "SELECT display_name FROM owner_surfaces WHERE session_id=? LIMIT 1",
+                    (sid,),
+                )
+            except Exception:
+                row = None
+        return str(row["display_name"]) if row and row["display_name"] else None
+
+    def bind_surface(
+        self,
+        session_id: str,
+        *,
+        platform: str = "desktop",
+        role: str = ROLE_OWNER,
+        display_name: str = "",
+    ) -> dict[str, Any]:
+        """Register a non-QQ surface (desktop pet) as the same owner role."""
+        sid = _require_private_session(session_id)
+        wanted = _normalise_role(role)
+        name = _clean_display_name(display_name) or (
+            self.default_display_name if wanted == ROLE_OWNER else self.default_friend_name
+        )
+        now = time.time()
+        self.db.execute(
+            "INSERT INTO owner_surfaces(session_id, platform, role, display_name, "
+            "created_at, last_seen_at) VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "platform=excluded.platform, role=excluded.role, "
+            "display_name=excluded.display_name, last_seen_at=excluded.last_seen_at",
+            (sid, str(platform or "desktop"), wanted, name, now, now),
+        )
+        return {
+            "session_id": sid,
+            "platform": str(platform or "desktop"),
+            "role": wanted,
+            "display_name": name,
+        }
 
     def status(self) -> dict[str, Any]:
         binding = self.get(ROLE_OWNER)
@@ -341,6 +402,15 @@ def _matches_role(db: Database, session_id: str, role: str) -> bool:
         )
     except Exception:
         # The table may not exist yet when context is assembled very early.
+        return False
+    if row is not None:
+        return True
+    try:
+        row = db.query_one(
+            "SELECT 1 AS hit FROM owner_surfaces WHERE session_id=? AND role=? LIMIT 1",
+            (sid, role),
+        )
+    except Exception:
         return False
     return row is not None
 

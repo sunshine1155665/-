@@ -158,8 +158,13 @@ class WakeupScheduler:
         # turn would burn the general wakeup.max_per_day in a single morning
         # and starve rituals / owner shares of slots. Cancelled self_continue
         # rows already drop out of both counts (status!='cancelled').
+        #
+        # 2026-11-15 boss mandate: ``..._max_per_day = 0`` means unlimited.
+        # Only 0 changes: a positive cap keeps the exact old "< cap" rule.
         if intent == SELF_CONTINUE_INTENT:
             max_per_day = int(self.config.get("wakeup.self_continue_max_per_day", 60))
+            if max_per_day == 0:
+                return True
             row = self.db.query_one(
                 "SELECT COUNT(*) AS n FROM wakeups WHERE created_at>=? AND created_at<? "
                 "AND status!='cancelled' AND intent=?",
@@ -167,6 +172,8 @@ class WakeupScheduler:
             )
             return bool(row and int(row["n"]) < max_per_day)
         max_per_day = int(self.config.get("wakeup.max_per_day", 5))
+        if max_per_day == 0:
+            return True
         row = self.db.query_one(
             "SELECT COUNT(*) AS n FROM wakeups WHERE created_at>=? AND created_at<? "
             "AND status!='cancelled' AND intent<>'self_continue'",
@@ -228,6 +235,7 @@ class ProactiveGate:
             (now - 86400,),
         )
         max_per_day = int(self.config.get("wakeup.max_per_day", 5))
-        if today_count and int(today_count["n"]) >= max_per_day:
+        # 0 = unlimited (2026-11-15); a positive cap keeps the exact old rule.
+        if max_per_day > 0 and today_count and int(today_count["n"]) >= max_per_day:
             return False, "daily_limit"
         return True, "ok"

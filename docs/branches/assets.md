@@ -15,7 +15,7 @@ updated: 2026-10-24
 | 路径 | 大小 | 说明 |
 |---|---|---|
 | `models/` | 10,857MB | IndexTTS-2.5 10,466 + bge 391 |
-| `vendor/` | 8,191MB | napcat 2,782 + SoulX 5,366 + index-tts-main 40 + singdeps 3.6 |
+| `vendor/` | ~2.8GB | napcat 2.8G + index-tts-main 41M（旧 SoulX-Singer/singdeps 已归档到 E 盘） |
 | `.venv-cosyvoice/` | 5,100MB | torch 供体（`.venv-soulx` 依赖） |
 | `.venv-indextts/` | 1,034MB | 产线 TTS 环境 |
 | `.venv-soulx/` | 117MB | 唱歌环境 |
@@ -32,21 +32,21 @@ updated: 2026-10-24
 | `data/soulx/prompt_v6.json` | 唱歌参考元数据，重建要重新对齐 |
 | `.venv-cosyvoice` | 被 `.venv-soulx` 借 torch，删了唱歌崩 |
 | `.venv-indextts` | 产线 TTS 环境 |
-| `vendor/SoulX-Singer/pretrained_models` | SVS + SVC 模型 |
+| `YUE2_ROOT` / `RVC_ROOT`（外部） | 产线唱歌的 YuE2 / RVC 环境与权重；不随仓分发 |
 | `data/fatfish.db` | 全部对话/记忆/认主 |
-| `data/stickers/` + `index.json` | 101 张图与打标 |
 | `fatfish/kernel.json` | 身份内核 |
 
 ## 重要数据资产
 
 | 路径 | 内容 |
 |---|---|
-| `data/soulx/prompt_v6.json` | 28 音节 / 5.54s / F0 55–73 |
-| `data/soulx/song_*`、`cand_*` | 各版本整歌 + report.json |
+| `data/soulx/prompt_v6.json` | 28 音节 / 5.54s / F0 55–73（产线参考元数据） |
+| `data/soulx/persona_song/report.json` | 默认歌歌词/底稿（产线） |
+| `data/soulx/melody_*`、`song_*`、`cand_*` | 旧 SoulX 时代 take，产线不读；归档候选 |
 | `data/whale_voice_demo_v2/` | 93 文件 / 28.6MB，参考音与 demo |
 | `data/audio_8d_scenes_v6/` | 8D 原型 20 文件（未接线） |
-| `data/stickers/` | 203 文件 / 49.5MB |
-| `data/photos/` | 3 张 / 3.7MB |
+| `data/stickers/` | 旧库资产，运行时不读；归档候选 |
+| `data/photos/` | 产线拍照产物 |
 | `data/backups/` | 手工备份（含夜间归档前快照） |
 
 ## 可清理（需确认）

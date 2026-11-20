@@ -4,7 +4,7 @@ Burning a run because the machine was already at 99% is the kind of mistake that
 looks like a model bug ("渲染出来是人声怪响 / 进程被 OOM 杀掉"). So every TTS or
 SVS run starts with this, not with the render:
 
-    python scripts/preflight.py --for svs          # 唱歌（SoulX-Singer）
+    python scripts/preflight.py --for svs          # 唱歌（YuE2 -> RVC）
     python scripts/preflight.py --for tts          # 语音（IndexTTS，9880）
     python scripts/preflight.py --for svs --unload-tts   # 先卸载语音服务再跑
 
@@ -28,16 +28,34 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 
-# What each kind of run needs, in GiB, measured on this machine (2026-10-25):
-#   SVS   peak 4.1 GB model + ~1 GB of activations/audio buffers
-#   TTS   IndexTTS-2.5 resident 5.8 GB + decode buffers
-NEED = {"svs": 5.5, "tts": 6.5}
-# Below this much free RAM the run either swaps or gets killed; 6 GiB is what the
-# SVS pipeline (torch + fp16 weights + librosa) actually holds.
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# Measured 2026-11-14 on this machine (see
+# .qqbot-lab/reports/task-memory-measurements.md), plus a safety margin.
+#   TTS loaded peak: RSS 7.2 GiB, GPU +5.6 GiB; unload keeps RSS 5.6 GiB
+#   singing peak:    RSS 12.4 GiB, GPU +4.7 GiB, 276 s
+#   embedding peak:  RSS 0.7 GiB, GPU +0.16 GiB
+# ``kill_tts`` is mandatory for sing/RVC: the TTS *process* must die, not just
+# unload, because its RSS does not shrink after /unload.
+# sing 的 GPU 门槛取实测峰值 4.7 GiB + 0.8 GiB 余量 = 5.5 GiB（2026-11-15 修正：
+# 之前照抄 TTS 的 6.5 GiB，导致桌面/浏览器占 2 GiB 时云端唱歌被误判"内存/显存紧"）。
+PROFILES: dict[str, dict[str, object]] = {
+    "embedding": {"gpu": 0.25, "ram": 1.0, "duration": 26, "kill_tts": False},
+    "tts": {"gpu": 6.5, "ram": 8.5, "duration": 91, "kill_tts": False},
+    "sing": {"gpu": 5.5, "ram": 14.5, "duration": 276, "kill_tts": True},
+}
+PROFILES["svs"] = dict(PROFILES["sing"])
+
+# Backwards-compatible names for older callers/tests.
+NEED = {name: float(profile["gpu"]) for name, profile in PROFILES.items()}
 NEED_RAM = 6.0
 SERVICES = {9880: "indextts", 9881: "embedding"}
 
@@ -142,6 +160,190 @@ def unload_tts(timeout: float = 60.0) -> bool:
         return False
 
 
+def _control_client(data_dir: str | Path | None):
+    """The supervisor control client, or None when no supervisor is running."""
+    try:
+        from fatfish.services import ControlClient, token_path
+    except Exception:  # pragma: no cover - app import must never break preflight
+        return None
+    token = token_path(data_dir or (ROOT / "data"))
+    if not token.is_file():
+        return None
+    return ControlClient(token)
+
+
+def _psutil():
+    try:
+        import psutil  # type: ignore
+        return psutil
+    except Exception:  # pragma: no cover - optional
+        return None
+
+
+def _tts_listener_pid() -> int:
+    ps = _psutil()
+    if ps is None:
+        return 0
+    try:
+        for conn in ps.net_connections(kind="tcp"):
+            if (
+                conn.status == ps.CONN_LISTEN
+                and conn.laddr
+                and conn.laddr.port == 9880
+                and conn.pid
+            ):
+                return int(conn.pid)
+    except (ps.Error, OSError):
+        pass
+    return 0
+
+
+def stop_tts_process(data_dir: str | Path | None = None, *, timeout: float = 45.0) -> bool:
+    """Kill the TTS process, not merely unload its model.
+
+    Prefer the supervisor; fall back to the real listener PID and verify its
+    command line before killing, so a stale pid file can never kill an
+    unrelated process.
+    """
+    client = _control_client(data_dir)
+    if client is not None:
+        try:
+            client.stop_and_wait("tts", timeout=timeout)
+            if service_state(9880) is None:
+                return True
+        except Exception:
+            pass
+    unload_tts(timeout=10.0)
+    ps = _psutil()
+    pid = _tts_listener_pid() or 0
+    if ps is not None and pid:
+        try:
+            proc = ps.Process(pid)
+            cmdline = " ".join(proc.cmdline())
+            if "indextts_server.py" in cmdline:
+                for child in proc.children(recursive=True) + [proc]:
+                    try:
+                        child.kill()
+                    except ps.Error:
+                        pass
+                ps.wait_procs([proc], timeout=10)
+        except ps.Error:
+            pass
+    if pid and ps is None:
+        # No psutil: use the pid file, but only after a port/listener match.
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"] if os.name == "nt"
+            else ["kill", "-9", str(pid)],
+            capture_output=True, timeout=15,
+        )
+    return service_state(9880) is None
+
+
+def start_tts_process(data_dir: str | Path | None = None, *, timeout: float = 60.0) -> bool:
+    """Start a fresh lightweight TTS process (no model warmup).
+
+    The supervisor path keeps the normal start_all ownership; the direct path
+    is a safety net for a crashed/absent control plane (observed once after a
+    song handoff).  Both paths pass the configured pitch so a restart does not
+    silently change her voice.
+    """
+    if service_state(9880) is not None:
+        return True
+    client = _control_client(data_dir)
+    if client is not None:
+        try:
+            client.start_and_wait("tts", timeout=timeout)
+            if service_state(9880) is not None:
+                return True
+        except Exception:
+            pass
+    python = ROOT / ".venv-indextts" / (
+        "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    )
+    server = ROOT / "scripts" / "indextts_server.py"
+    if not python.is_file() or not server.is_file():
+        return False
+    pitch = 1
+    try:
+        from fatfish.config import load_config
+
+        pitch = int(load_config("low").get("tts.pitch_semitones", 1))
+    except Exception:
+        pass
+    log_path = Path(data_dir or (ROOT / "data")) / "logs" / "tts.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    with log_path.open("ab") as handle:
+        proc = subprocess.Popen(
+            [
+                str(python), str(server),
+                "--host", "127.0.0.1", "--port", "9880",
+                "--idle-unload-seconds", "0",
+                "--pitch-semitones", str(pitch),
+            ],
+            cwd=str(ROOT),
+            stdin=subprocess.DEVNULL,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            creationflags=creationflags,
+        )
+    try:
+        (Path(data_dir or (ROOT / "data")) / "run" / "tts.pid").write_text(
+            str(proc.pid) + "\n", encoding="ascii"
+        )
+    except OSError:
+        pass
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        if service_state(9880) is not None:
+            return True
+        time.sleep(0.4)
+    return False
+
+
+def loaded_services() -> dict[int, bool]:
+    loaded: dict[int, bool] = {}
+    for port in SERVICES:
+        state = service_state(port)
+        if state is not None:
+            loaded[port] = bool(state.get("loaded"))
+    return loaded
+
+
+def check(
+    task: str,
+    *,
+    data_dir: str | Path | None = None,
+    kill_tts: bool = False,
+    need_gpu: float | None = None,
+    need_ram: float | None = None,
+) -> tuple[bool, list[str], dict]:
+    """Programmatic preflight used by service startup hooks and the CLI."""
+    key = "sing" if task == "svs" else task
+    profile = PROFILES.get(key)
+    if profile is None:
+        raise KeyError(f"unknown preflight task: {task}")
+    if kill_tts:
+        stop_tts_process(data_dir)
+    need_gpu = float(profile["gpu"] if need_gpu is None else need_gpu)
+    need_ram = float(profile["ram"] if need_ram is None else need_ram)
+    g = gpu()
+    mem = ram()
+    loaded = loaded_services()
+    ok, notes = verdict(need_gpu, need_ram, g, mem, loaded)
+    return ok, notes, {
+        "task": key,
+        "need_gpu_gib": need_gpu,
+        "need_ram_gib": need_ram,
+        "gpu_free_gib": None if g is None else round(g.free, 3),
+        "ram_available_gib": None if mem is None else round(mem[0], 3),
+        "loaded": {str(k): v for k, v in loaded.items()},
+        "ok": ok,
+    }
+
+
 def verdict(need_gpu: float, need_ram: float, g: Gpu | None,
             mem: tuple[float, float] | None,
             loaded: dict[int, bool]) -> tuple[bool, list[str]]:
@@ -176,40 +378,41 @@ def verdict(need_gpu: float, need_ram: float, g: Gpu | None,
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="跑模型前先看内存/显存")
-    ap.add_argument("--for", dest="kind", choices=sorted(NEED), default="svs",
-                    help="这次要跑什么（决定要多少显存）")
+    ap.add_argument("--for", dest="kind", choices=sorted(PROFILES), default="svs",
+                    help="这次要跑什么（决定要多少显存/内存）")
     ap.add_argument("--need-gpu", type=float, default=None,
                     help="覆盖默认显存阈值（GiB）")
-    ap.add_argument("--need-ram", type=float, default=NEED_RAM)
+    ap.add_argument("--need-ram", type=float, default=None,
+                    help="覆盖默认内存阈值（GiB）")
     ap.add_argument("--unload-tts", action="store_true",
                     help="不够就先 POST /unload 卸掉语音服务，再复查")
+    ap.add_argument("--kill-tts", action="store_true",
+                    help="唱歌/RVC 前杀掉 TTS 进程（不是只 unload）")
+    ap.add_argument("--data-dir", default=str(ROOT / "data"))
+    ap.add_argument("--json", action="store_true", help="输出机器可读 JSON")
     args = ap.parse_args(argv)
 
-    need_gpu = args.need_gpu if args.need_gpu is not None else NEED[args.kind]
-    g = gpu()
-    mem = ram()
-    loaded = {}
-    for port in SERVICES:
-        st = service_state(port)
-        if st is not None:
-            loaded[port] = bool(st.get("loaded"))
-    ok, notes = verdict(need_gpu, args.need_ram, g, mem, loaded)
-    print(f"== preflight: --for {args.kind} "
-          f"(需要 GPU {need_gpu:.1f} GiB / RAM {args.need_ram:.1f} GiB)")
-    for n in notes:
-        print("  " + n)
-
-    if not ok and args.unload_tts and loaded.get(9880):
-        print("  -> 卸载 9880（IndexTTS）…")
-        print("  -> " + ("unload ok" if unload_tts() else "unload 失败"))
-        g = gpu()
-        mem = ram()
-        loaded[9880] = bool((service_state(9880) or {}).get("loaded"))
-        ok, notes = verdict(need_gpu, args.need_ram, g, mem, loaded)
+    profile = PROFILES[args.kind]
+    need_gpu = float(args.need_gpu if args.need_gpu is not None else profile["gpu"])
+    need_ram = float(args.need_ram if args.need_ram is not None else profile["ram"])
+    if args.unload_tts and not (args.kill_tts or profile.get("kill_tts")):
+        print("  -> 只 unload 不够：TTS 进程 RSS 不会释放；唱歌建议 --kill-tts")
+        unload_tts()
+    ok, notes, data = check(
+        args.kind,
+        data_dir=args.data_dir,
+        kill_tts=bool(args.kill_tts),
+        need_gpu=need_gpu,
+        need_ram=need_ram,
+    )
+    if args.json:
+        print(json.dumps({**data, "notes": notes}, ensure_ascii=False, indent=2))
+    else:
+        print(f"== preflight: --for {args.kind} "
+              f"(需要 GPU {need_gpu:.1f} GiB / RAM {need_ram:.1f} GiB)")
         for n in notes:
             print("  " + n)
-
-    print("  => " + ("可以跑" if ok else "先别跑"))
+        print("  => " + ("可以跑" if ok else "先别跑"))
     return 0 if ok else 1
 
 

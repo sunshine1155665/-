@@ -3,23 +3,16 @@
 from __future__ import annotations
 
 import ctypes
-import json
 import os
 import platform
 import shutil
 import sqlite3
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any
 
 from .config import Config
 from .security import KernelError, load_kernel
-
-# Mirrors fatfish.memory.embedder.HTTP_BACKENDS; imported by value to keep the
-# doctor importable even if that module grows heavy dependencies later.
-_HTTP_BACKENDS = frozenset({"http", "service", "bge", "remote"})
 
 try:
     import psutil  # type: ignore
@@ -58,55 +51,41 @@ def _available_ram_bytes() -> int | None:
     return int(total * 0.5) if total else None
 
 
-def _sticker_embedding_report(config: Config) -> dict[str, Any]:
-    """Is the sticker vector path actually working?
+def _sticker_generation_report(config: Config) -> dict[str, Any]:
+    """Is the LoRA sticker path configured?
 
-    The interesting failure is silent: if the stored vectors were written by a
-    different backend, every similarity is 0 and ranking quietly degrades to
-    keyword overlap. Nothing crashes, so nothing complains -- unless we look.
+    There is no local service to probe any more: the render happens on
+    ModelScope, so the interesting facts are the model/loras and whether the
+    API key the client will look for is present.  Pending jobs are counted so
+    a stuck async queue is visible without opening the DB.
     """
-    backend = str(
-        config.get("sticker.embedding_backend")
-        or config.get("memory.embedding_backend", "hash")
-    ).strip().lower()
-    url = str(config.get("sticker.embedding_url") or "").strip()
-    info: dict[str, Any] = {"backend": backend, "reachable": None, "stored_width": None}
-
-    stored = None
+    env_name = str(
+        config.get("sticker.modelscope_api_key_env") or "MODELSCOPE_API_KEY"
+    ).strip()
+    raw_loras = config.get("sticker.generation_loras") or []
+    if isinstance(raw_loras, str):
+        raw_loras = [raw_loras]
+    pending: int | None
     try:
         conn = sqlite3.connect(f"file:{config.db_path}?mode=ro", uri=True, timeout=2.0)
         try:
             row = conn.execute(
-                "SELECT embedding_text FROM stickers "
-                "WHERE active=1 AND embedding_text IS NOT NULL LIMIT 1"
+                "SELECT COUNT(*) FROM sticker_jobs "
+                "WHERE status IN ('waiting','running')"
             ).fetchone()
         finally:
             conn.close()
-        if row and row[0]:
-            stored = len(json.loads(row[0]))
-    except (OSError, sqlite3.Error, ValueError, TypeError):
-        stored = None
-    info["stored_width"] = stored
-
-    if backend in _HTTP_BACKENDS:
-        info["url"] = url
-        if not url:
-            info["reachable"] = False
-        else:
-            health_url = url.rsplit("/", 1)[0] + "/health"
-            try:
-                with urllib.request.urlopen(health_url, timeout=1.5) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                info["reachable"] = bool(payload.get("ok"))
-                info["served_width"] = payload.get("dim")
-            except (OSError, ValueError, urllib.error.URLError):
-                info["reachable"] = False
-
-    served = info.get("served_width") or stored
-    info["width_matches"] = (
-        None if not stored or not served else int(stored) == int(served)
-    )
-    return info
+        pending = int(row[0]) if row else 0
+    except (OSError, sqlite3.Error):
+        pending = None
+    return {
+        "enabled": bool(config.get("sticker.generation_enabled", True)),
+        "model": str(config.get("sticker.generation_model") or ""),
+        "loras": [str(item) for item in raw_loras if str(item).strip()],
+        "api_key_env": env_name,
+        "api_key_present": bool(os.environ.get(env_name, "").strip()),
+        "pending_jobs": pending,
+    }
 
 
 def check(config: Config) -> dict[str, Any]:
@@ -168,7 +147,7 @@ def check(config: Config) -> dict[str, Any]:
         "llm_key_present": llm_key_present,
         "tts_enabled": tts_enabled,
         "tts_configured": tts_configured,
-        "sticker_embedding": _sticker_embedding_report(config),
+        "sticker_generation": _sticker_generation_report(config),
         "warnings": [],
         "ok": True,
     }
@@ -198,25 +177,20 @@ def check(config: Config) -> dict[str, Any]:
         report["warnings"].append(
             "TTS is enabled but base_url/command is empty; voice output will fail."
         )
-    emb = report["sticker_embedding"]
-    if emb["backend"] in _HTTP_BACKENDS and emb.get("reachable") is False:
+    gen = report["sticker_generation"]
+    if gen["enabled"] and not gen["api_key_present"]:
         report["warnings"].append(
-            f"Sticker embedding service at {emb.get('url') or '(no url)'} is unreachable; "
-            "sticker ranking falls back to hashing (no crash, weaker matches)."
-        )
-    if emb.get("width_matches") is False:
-        report["warnings"].append(
-            f"Sticker vectors are {emb['stored_width']}-dim but the service serves "
-            f"{emb.get('served_width')}-dim; every similarity will be 0. "
-            "Rebuild the sticker vector index for the active backend."
+            f"{gen['api_key_env']} is not set; sticker generation will be skipped "
+            "(no crash, she just sends no sticker)."
         )
     return report
 
 
 def _recommend(total_ram: int | None, current: str) -> str:
-    if current == "cloud":
-        # cloud 是部署形态（在线层 + 家里 GPU），不是资源档位：这台机器
-        # 只跑接入/编排/记忆，按内存反推 low/standard 没有意义。
+    if current in {"cloud", "modelscope", "moss-photo"}:
+        # cloud 是部署形态（在线层 + 家里 GPU）；modelscope / moss-photo 是
+        # LLM 线路或拍照后端的叠加层（资源设置继承 low）。它们都不是资源
+        # 档位，按内存反推 low/standard 没有意义，也不该报「建议换档」。
         return current
     if total_ram is None:
         return current
@@ -247,13 +221,12 @@ def format_report(report: dict[str, Any]) -> str:
         f"llm key:              {report['llm_key_env']} present={report['llm_key_present']}",
         f"tts:                  enabled={report['tts_enabled']} configured={report['tts_configured']}",
     ]
-    emb = report.get("sticker_embedding") or {}
-    if emb:
-        served = emb.get("served_width") or "?"
+    gen = report.get("sticker_generation") or {}
+    if gen:
         lines.append(
-            f"sticker vectors:      backend={emb.get('backend')} "
-            f"stored={emb.get('stored_width') or '?'}d served={served}d "
-            f"reachable={emb.get('reachable')}"
+            f"sticker gen:          enabled={gen.get('enabled')} "
+            f"model={gen.get('model') or '?'} loras={len(gen.get('loras') or [])} "
+            f"key={gen.get('api_key_present')} pending={gen.get('pending_jobs')}"
         )
     if report["warnings"]:
         lines.append("warnings:")
