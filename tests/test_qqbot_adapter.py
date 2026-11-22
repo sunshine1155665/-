@@ -1129,6 +1129,58 @@ class QQBotPhaseATests(unittest.TestCase):
         self.assertIn("撒娇", joined)
         self.assertEqual(adapter.counters["media_downloaded"], 1)
 
+    def test_image_only_message_uses_bare_placeholder(self) -> None:
+        """无文字图片的占位符是 `[图片]`，不是「（发来一张图）」（2026-11-22）。
+
+        旧占位语被 runtime 的 wants_photo 旁路当成「发…图」拍照指令：
+        发任何一张图都机械回「好，我去拍」。占位符只描述媒体存在。
+        """
+        runtime = FakeRuntime()
+        adapter = QQBotAdapter(
+            runtime,
+            self._config(),
+            media_downloader=lambda url, **kwargs: b"png-bytes",
+        )
+        event = c2c_event(text="", msg_id="IMG-ONLY-1")
+        event["d"]["attachments"] = [
+            {"content_type": "image/png", "url": "https://example.invalid/a.png"},
+        ]
+        adapter.handle_event(event)
+        self.assertEqual(len(runtime.calls), 1)
+        self.assertEqual(runtime.calls[0]["text"], "[图片]")
+        images = runtime.extras[0]["images"] or []
+        self.assertEqual(len(images), 1)
+        self.assertTrue(images[0].startswith("data:image/png;base64,"))
+
+    def test_image_only_multiple_images_get_counted_placeholder(self) -> None:
+        runtime = FakeRuntime()
+        adapter = QQBotAdapter(
+            runtime,
+            self._config(),
+            media_downloader=lambda url, **kwargs: b"png-bytes",
+        )
+        event = c2c_event(text="", msg_id="IMG-ONLY-2")
+        event["d"]["attachments"] = [
+            {"content_type": "image/png", "url": "https://example.invalid/a.png"},
+            {"content_type": "image/png", "url": "https://example.invalid/b.png"},
+        ]
+        adapter.handle_event(event)
+        self.assertEqual(runtime.calls[0]["text"], "[图片]×2")
+
+    def test_captioned_image_keeps_owner_words_untouched(self) -> None:
+        runtime = FakeRuntime()
+        adapter = QQBotAdapter(
+            runtime,
+            self._config(),
+            media_downloader=lambda url, **kwargs: b"png-bytes",
+        )
+        event = c2c_event(text="看我家猫", msg_id="IMG-CAPTION-1")
+        event["d"]["attachments"] = [
+            {"content_type": "image/png", "url": "https://example.invalid/a.png"},
+        ]
+        adapter.handle_event(event)
+        self.assertEqual(runtime.calls[0]["text"], "看我家猫")
+
     def test_merge_window_collapses_burst_into_one_turn(self) -> None:
         runtime = FakeRuntime()
         adapter = QQBotAdapter(runtime, self._config(merge_window_seconds=0.5))

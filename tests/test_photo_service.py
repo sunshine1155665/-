@@ -297,6 +297,18 @@ class PhotoDetectionTests(unittest.TestCase):
         ):
             self.assertFalse(wants_photo(text), text)
 
+    def test_image_placeholder_is_never_a_request(self) -> None:
+        """适配器合成的图片占位符不是主人的话（2026-11-22 云端实测）。
+
+        qqbot 曾把无文字图片合成「（发来一张图）」，被「发…图」分支命中，
+        于是发任何一张图都机械回「好，我去拍」。占位符必须整体剥掉。
+        """
+        for text in ("[图片]", "[图片]×2", "[图片]\n这张好可爱"):
+            self.assertFalse(wants_photo(text), text)
+        # 占位符剥掉后，剩下的正文照常判定。
+        self.assertTrue(wants_photo("[图片]\n帮我拍一张"), "占位符+明确请求")
+        self.assertFalse(wants_photo("[图片]\n今天好累"), "占位符+无关正文")
+
 
 class PhotoPromptTests(unittest.TestCase):
     def setUp(self) -> None:

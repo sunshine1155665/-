@@ -1503,7 +1503,12 @@ class QQBotAdapter:
         if images:
             message.images.extend(images)
             if not message.text:
-                message.text = "（发来一张图）"
+                # 与 qq.py 的 `_compose_turn_text` 同一占位约定。曾经写成
+                # 「（发来一张图）」，被 runtime 的 wants_photo 旁路当成
+                # 「发…图」拍照指令：发任何一张图都机械回「好，我去拍」。
+                # 占位符只描述媒体存在，绝不能长得像主人的请求。
+                placeholder = "[图片]" if len(images) == 1 else f"[图片]×{len(images)}"
+                message.text = placeholder
         if media_missing:
             message.extra_evidence.append(MEDIA_MISS_HINT)
         if not message.text:

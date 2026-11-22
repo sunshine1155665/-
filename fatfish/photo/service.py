@@ -242,9 +242,17 @@ _ERROR_MESSAGES = {
 }
 
 
+#: 适配器为图片消息合成的占位符（qq.py/qqbot.py 共用约定）。匹配前先剥掉：
+#: 占位符是「这张消息带了图」的描述，不是主人的话，不允许参与拍照判定。
+_IMAGE_PLACEHOLDER_RE = re.compile(r"\[图片\](?:×\d+)?")
+
+
 def wants_photo(text: str | None) -> bool:
     """True when a private-chat message explicitly asks for a photo."""
-    raw = str(text or "")
+    # 只看主人真正打出的字。曾经 qqbot 的占位语「（发来一张图）」被下面的
+    # 「发…图」分支命中，云端发任何一张图都被当成拍照指令、机械回
+    # 「好，我去拍」——根因是让合成文本参与了请求判定，不是正则太宽。
+    raw = _IMAGE_PLACEHOLDER_RE.sub("", str(text or ""))
     if _PHOTO_REFERENCE_RE.search(raw):
         return False
     # 「这张照片拍得真好」是在评价，不是在要新图；只有同时带请求动词
