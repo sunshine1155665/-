@@ -870,6 +870,26 @@ def wants_qzone_live_refresh(text: str | None) -> bool:
     return any(word in raw for word in QZONE_LIVE_WORDS)
 
 
+#: 路由键前缀映射：临时会话 → 供 ``x-opencode-session`` 使用的稳定键。
+#: 网关按这个头做粘性路由和提示词缓存分区（2026-11-24 实测：同 key 连发
+#: 命中 ~84%，换 key 就重新洗牌；不含该头直接 400 MissingSessionID）。
+#: 自主决策轮每 30 分钟换一个 ``activity-YYYYMMDD-HHMM``，各落一个上游账号，
+#: 于是 ~8k 的稳定前缀永远按全量未命中计费——LLM 头改用稳定键后，相邻轮次
+#: 只要缓存未过期就能吃到前缀。会话 id 本身（记忆/台账/短期历史）不变。
+_LLM_ROUTING_SESSION_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("activity-", "activity"),
+)
+
+
+def llm_routing_session(session_id: str | None) -> str | None:
+    """Map an ephemeral runtime session to a stable LLM routing key."""
+    text = str(session_id or "")
+    for prefix, stable in _LLM_ROUTING_SESSION_PREFIXES:
+        if text.startswith(prefix):
+            return stable
+    return session_id
+
+
 # Per-session live-fetch cooldown (phase 1 item 3): one network pull per
 # collector per session every ``chat.live_fetch_cooldown_minutes``. The
 # watermark is written *before* the fetch (crash cannot tighten the loop),
@@ -1549,7 +1569,10 @@ class Runtime:
         )
 
         result = (
-            self.llm.chat(bundle.model_messages(), session_id=session_id)
+            self.llm.chat(
+                bundle.model_messages(),
+                session_id=llm_routing_session(session_id),
+            )
             if self.llm.available
             else None
         )
@@ -1584,7 +1607,7 @@ class Runtime:
                     {"role": "assistant", "content": str(result.text or "")[:2000]},
                     {"role": "user", "content": JSON_REPAIR_PROMPT},
                 ],
-                session_id=session_id,
+                session_id=llm_routing_session(session_id),
             )
             repaired = parse_turn_plan(
                 retry.text,
@@ -2961,6 +2984,9 @@ class Runtime:
             result = self.llm.chat(
                 [{"role": "system", "content": prompt}],
                 temperature=0.2,
+                # 网关拒绝不带 x-opencode-session 的请求（400 MissingSessionID），
+                # 之前这里没传，歌词修复其实一直没生效；给个稳定的伪会话。
+                session_id="sing:lyrics",
             )
         except Exception:  # repair must never break the song request
             return None

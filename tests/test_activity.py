@@ -29,6 +29,7 @@ from fatfish.photo import wants_photo
 from fatfish.runtime import (
     DEFAULT_ACTIVITY_DECISION_PROMPT,
     Runtime,
+    llm_routing_session,
     wants_qzone_review,
 )
 from fatfish.voice import VoiceDecision
@@ -298,6 +299,13 @@ class DisabledAndGatingTests(ActivityTestBase):
 
 
 class DecisionTurnTests(ActivityTestBase):
+    def test_llm_routing_session_maps_ephemeral_activity_sessions(self) -> None:
+        # 网关按 x-opencode-session 做粘性路由/缓存分区：activity 每轮换 id
+        # 会永远冷启动，所以只有 LLM 头用稳定键，真实 session 原样保留。
+        self.assertEqual("activity", llm_routing_session("activity-20261124-0800"))
+        self.assertEqual("qq:private:ABC", llm_routing_session("qq:private:ABC"))
+        self.assertIsNone(llm_routing_session(None))
+
     def test_turn_calls_llm_with_menu_and_cleans_binding(self) -> None:
         config, db, runtime = self.make_env(bind_friend=True)
         llm = BindingSpyLLM(db)
@@ -312,7 +320,9 @@ class DecisionTurnTests(ActivityTestBase):
         self.assertEqual("act", result["decision"])
         self.assertEqual(1, len(llm.calls))
         call = llm.calls[0]
-        self.assertTrue(str(call["session_id"]).startswith("activity-20261024-"))
+        # 2026-11-24: LLM 的 x-opencode-session 用稳定路由键（缓存分区/粘性
+        # 路由按这个头），否则每 30 分钟换一次 id 就永远全量未命中。
+        self.assertEqual("activity", call["session_id"])
         prompt_text = json.dumps(call["messages"], ensure_ascii=False)
         # Menu data is all there.
         self.assertIn("今天面试好累", prompt_text)
@@ -338,7 +348,9 @@ class DecisionTurnTests(ActivityTestBase):
             "AND action='decide'"
         )
         self.assertEqual("act", row["outcome"])
-        self.assertEqual(call["session_id"], row["session_id"])
+        self.assertTrue(str(row["session_id"]).startswith("activity-20261024-"))
+        # 台账/决策日志仍记真实会话；只有 LLM 路由头用了稳定键。
+        self.assertEqual("activity", call["session_id"])
         # Ledger row with token accounting (fake usage = 14 per call).
         rows = self.ledger_rows(config)
         self.assertEqual(1, len(rows))
